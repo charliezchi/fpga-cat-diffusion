@@ -35,3 +35,13 @@
 ## License
 
 [MIT](LICENSE)
+
+## 开发环境（M0 PC 算法管线）
+
+```bash
+uv sync                 # 安装全部依赖（含 pytest）
+uv run pytest           # 运行测试
+uv run python -m catdiff.baseline.cli --help   # 采样入口（F1 起可用）
+```
+
+仅 CPU 环境即可；`artifacts/` 为采样产物目录，不入库。

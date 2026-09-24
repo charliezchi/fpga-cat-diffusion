@@ -22,3 +22,7 @@ export/weights/*.bin
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# M0 Python 工程补充（spec §3：采样产物不入库）
+artifacts/
+dist/

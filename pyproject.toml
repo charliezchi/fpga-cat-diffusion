@@ -1,0 +1,25 @@
+[project]
+name = "catdiff"
+version = "0.1.0"
+description = "FPGA cat diffusion - PC algorithm pipeline (M0)"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.2",
+    "diffusers>=0.30",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "huggingface-hub>=0.24",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/catdiff"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
