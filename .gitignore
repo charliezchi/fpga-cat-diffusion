@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# EDA / 仿真产物
+hq_run/
+work/
+transcript
+vsim.wlf
+*.wdb
+*.mpf
+modelsim.ini
+
+# 大文件产物（权重与比特流不进 git，按需走 Release）
+*.bit
+export/weights/*.bin
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
