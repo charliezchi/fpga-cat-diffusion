@@ -2,8 +2,8 @@
 
 | 文档信息 | |
 |---|---|
-| 版本 | v1.2（F3 消融定论：注意力必需，F4/F5 按完整网络；注意力 RTL 升为主线） |
-| 日期 | 2026-09-25（v1.2） |
+| 版本 | v1.3（F4 结案定稿：INT8 混合精度 + DDIM-50/20 双档 + 顺序标定，changelog 见 docs/quality-gates/f4-int8-quality-report.md v3 节） |
+| 日期 | 2026-09-25（v1.3） |
 | 状态 | 已获设计批准，待 spec 评审 |
 | 上游文档 | `docs/feasibility-and-plan.md`（总提案，本文档与其冲突时以总提案的最新决策为准） |
 | 子项目代号 | M0 / PC-algorithm-pipeline |
@@ -106,20 +106,30 @@ fpga-cat-diffusion/
 - 实验于 2026-09-25 完成（报告：`docs/quality-gates/f3-attention-ablation-report.md`）：完整模型 A 组 20/20 可辨猫；去除全部注意力 B 组 0/20；仅保留 mid 注意力 C 组 0/20。
 - **结论：注意力（6 处，全部单头 512 通道）为必需组件。** F4/F5 按完整网络（含注意力）做 PTQ 与黄金向量；注意力 RTL 由 M4 可选项升为主线工作量（总提案 v0.2 §7 同步更新）。
 
-### 5.4 L2 量化与导出（F4）
+### 5.4 L2 量化与导出（F4）——已结案，方案 **v3 混合精度**（v1.3 定稿）
 
-- PTQ INT8：权重 per-channel 对称量化；激活按"步组"静态标定（**DDIM-20 分 5 组 × 4 步**，每组一套 scale——v1.2 注：原文"DDIM-50 分 4~8 组"写于 DDIM-20 决策前，以 F4 plan 为准），标定数据来自 L1 模型在固定 seed 集上的激活统计。**标定在 256×256 下进行**；CPU 上每次 256 前向约 2~3 秒，标定集 4 seeds × 20 步（v1.1 补充）；
-- 量化方案参数（组数、per-channel/per-tensor、饱和策略）集中在一个配置文件中，可复现实验；
+- PTQ INT8 混合精度（v1.3 按 F4 结案形态修订；方案依据与诊断链见
+  `docs/quality-gates/f4-int8-quality-report.md` v3 节）：内部 152 个权重层
+  per-channel 对称 INT8 + 激活 per-tensor 对称 INT8（P99.95，**10 步组**）；
+  **conv_in / conv_out 权重 per-channel INT16**，**eps（conv_out 输出）INT16**；
+- 推理步数双档（v1.3）：**DDIM-50 主档 / DDIM-20 快速预览档**（eta=0），两档的
+  DDIM 表、FiLM 表、激活 scale 表均导出，运行时切换；DDIM-100 严格复测退步，关闭；
+- 顺序标定（v1.3）：权重先量化就位，再在真实量化轨迹上采集激活统计；标定集
+  8 seeds（200..207）× DDIM 全程，**标定在 256×256 下进行**（v1.1 补充）；
+- 量化方案参数（步数、组数、百分位、混合精度层清单、顺序标定开关）集中在
+  配置文件中（`configs/quant_int8.json` 主档 / `configs/quant_int8_ddim20.json`
+  预览档），可复现实验；
 - 用 PyTorch 浮点模拟量化（fake-quant 参考）先验证画质：INT8 采样 20 张人工验收；
-- 导出（格式在本 feature 的 plan 中冻结，写入 `docs/` 格式说明）：
-  - `weights.bin`（INT8 权重 + per-channel scale）；
-  - 层描述符表（cin/cout/stride/pad/算子类型/标度索引）；
-  - DDIM 常数表（√ᾱ 序列，定点化）；
-  - FiLM 表（各时间步 per-channel scale/shift，定点化）。
+- 导出（v3 格式契约冻结于 `docs/quant-format.md`，bundle 在 `artifacts/f4/export-v3/`）：
+  - `weights.bin`（CDW2：INT8/INT16 权重 + per-channel scale + bits 字段）；
+  - 层描述符表（含位宽标记）；
+  - DDIM 常数表（50/20 两份）；
+  - FiLM 表（50/20 两份）；
+  - 激活 scale 表（50/20 两份，v1.3 新增）。
 
 ### 5.5 L2 位真模拟器与黄金向量（F5）
 
-- numpy 实现的算子级位真定点模拟器：逐算子复现目标 RTL 数值行为——INT8×INT8 乘、INT32 累加、per-channel 移位重整、截位与饱和；Q 格式定义集中在 `quant/` 一处；
+- numpy 实现的算子级位真定点模拟器：逐算子复现目标 RTL 数值行为——INT8×INT8 乘、INT32 累加、per-channel 移位重整、截位与饱和（v1.3：另含契约 v3 的 conv_in/conv_out INT16 权重与 eps INT16 路径）；Q 格式定义集中在 `quant/` 一处；
 - 与 F4 的 fake-quant PyTorch 参考**逐比特对齐**（逐层中间结果 + 最终图像）；
 - 导出 ModelSim 黄金向量：选定层（覆盖每种算子类型至少一层，输入可为裁剪后的小块以控制体积）的输入/权重/输出十六进制向量 + 全网络端到端一组（**256×256 输入**）（v1.1 修订）；
 - 位真模拟器跑完整 DDIM 采样得到的最终图像与 fake-quant 参考一致（逐比特或明确记录的例外）。
