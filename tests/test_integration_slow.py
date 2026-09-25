@@ -4,7 +4,6 @@
 """
 
 import json
-import types
 from pathlib import Path
 
 import pytest
@@ -13,7 +12,7 @@ import torch
 from catdiff.baseline.sampling import sample_batch, tensor_to_pil
 from catdiff.model.ddim import DDIMScheduler
 from catdiff.model.trace import forward_with_trace
-from catdiff.model.unet import UNet2D, load_handwritten_unet
+from catdiff.model.unet import UNet2D, as_diffusers_output, load_handwritten_unet
 
 pytestmark = pytest.mark.slow
 
@@ -24,20 +23,6 @@ BFLY_CONFIG = json.loads((REF / "unet-config-butterflies-64.json").read_text())
 
 def _rel(a, b):
     return ((a - b).abs().max() / b.abs().max()).item()
-
-
-class _AsDiffusersOutput:
-    """把手写模型（返回裸 tensor）适配成 sample_batch 期望的 .sample 接口。"""
-
-    def __init__(self, model):
-        self._m = model
-        self.config = types.SimpleNamespace(in_channels=3)
-
-    def __call__(self, x, t):
-        return types.SimpleNamespace(sample=self._m(x, t))
-
-    def to(self, device):
-        return self
 
 
 def test_cat_forward_64_and_256():
@@ -105,7 +90,7 @@ def test_cat_ddim20_256_final_image():
 
     img_ref = sample_batch(ref_model, ref_sched, num_samples=1,
                            image_size=256, seed=100)
-    img_ours = sample_batch(_AsDiffusersOutput(ours), our_sched,
+    img_ours = sample_batch(as_diffusers_output(ours), our_sched,
                             num_samples=1, image_size=256, seed=100)
     max_abs = (img_ours - img_ref).abs().max().item()
     out_dir = Path("artifacts/f2")

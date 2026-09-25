@@ -3,6 +3,8 @@
 state_dict 命名与 diffusers 完全镜像，load_state_dict 严格加载即完成权重映射。
 """
 
+import types
+
 import torch
 from torch import nn
 
@@ -94,3 +96,20 @@ def load_handwritten_unet(model_id: str, config: dict) -> UNet2D:
     model.load_state_dict(ref.state_dict())  # strict：命名漂移在此报错
     model.eval()
     return model
+
+
+def as_diffusers_output(model: UNet2D, in_channels: int = 3):
+    """把手写模型（返回裸 tensor）适配成 baseline.sample_batch 期望的接口。"""
+
+    class _Adapter:
+        def __init__(self, m):
+            self._m = m
+            self.config = types.SimpleNamespace(in_channels=in_channels)
+
+        def __call__(self, x, t):
+            return types.SimpleNamespace(sample=self._m(x, t))
+
+        def to(self, device):
+            return self
+
+    return _Adapter(model)
