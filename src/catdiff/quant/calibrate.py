@@ -1,17 +1,39 @@
-"""激活静态标定：按"层 × 步组"统计 P99.9(|activation|)（契约 §1/§2）。"""
+"""激活静态标定：按"层 × 步组"统计 P99.95(|activation|)（契约 §1/§2）。
+
+顺序标定（契约 v3，config `calibration.sequential=true` 时启用）：先把权重按
+目标位宽 Q/DQ 就位，再在真实量化轨迹上采集激活统计。
+"""
 
 import json
 from pathlib import Path
 
 import torch
+from torch import nn
 
 from catdiff.model.trace import forward_with_trace
+from catdiff.quant.weights import dequantize_per_channel, quantize_per_channel
 
 
 def step_to_group(step_idx: int, num_steps: int, num_groups: int) -> int:
-    """推理步序号 → 步组号（均分，20 步 5 组 = 每组 4 步）。"""
+    """推理步序号 → 步组号（均分，50 步 10 组 = 每组 5 步）。"""
     per_group = num_steps // num_groups
     return min(step_idx // per_group, num_groups - 1)
+
+
+def quantize_weights_in_place(model: nn.Module, int16_layers: tuple = ()) -> int:
+    """权重按目标位宽 Q/DQ 并就地替换 Parameter（顺序标定第一步）。
+
+    int16_layers 按模块名首段前缀匹配（name.split(".")[0]）。返回处理的层数。
+    """
+    count = 0
+    for name, mod in model.named_modules():
+        if isinstance(mod, (nn.Conv2d, nn.Linear)):
+            bits = 16 if name.split(".")[0] in int16_layers else 8
+            w_q, scales = quantize_per_channel(mod.weight.detach(), axis=0, bits=bits)
+            mod.weight = nn.Parameter(dequantize_per_channel(w_q, scales, axis=0),
+                                      requires_grad=False)
+            count += 1
+    return count
 
 
 def update_percentile_stats(stats: dict, name: str, group: int, tensor: torch.Tensor,
@@ -24,8 +46,8 @@ def update_percentile_stats(stats: dict, name: str, group: int, tensor: torch.Te
     stats.setdefault(name, {}).setdefault(group, []).extend(flat.tolist())
 
 
-def finalize_scales(stats: dict, percentile: float = 99.9) -> dict:
-    """{layer: {group: scale}}，scale = P99.9(|a|) / 127。"""
+def finalize_scales(stats: dict, percentile: float = 99.95) -> dict:
+    """{layer: {group: scale}}，scale = P99.95(|a|) / 127（INT8 量程基准）。"""
     out = {}
     for name, groups in stats.items():
         out[name] = {}
@@ -39,7 +61,11 @@ def finalize_scales(stats: dict, percentile: float = 99.9) -> dict:
 @torch.no_grad()
 def run_calibration(config_path: str = "configs/quant_int8.json",
                     out_path: str = "artifacts/f4/calib-stats.json") -> None:
-    """slow：对手写 cat-256 在标定 seed 集上跑 DDIM-20 全程并采集统计。"""
+    """slow：对手写 cat-256 在标定 seed 集上跑 DDIM 全程并采集统计。
+
+    config `calibration.sequential=true` 时先按契约把权重 Q/DQ 就位，
+    在真实量化轨迹上采集（v3 顺序标定）；否则保持 fp32 轨迹。
+    """
     from catdiff.model.ddim import DDIMScheduler
     from catdiff.model.unet import load_handwritten_unet
 
@@ -49,6 +75,11 @@ def run_calibration(config_path: str = "configs/quant_int8.json",
     n_steps = cfg["schedule"]["num_inference_steps"]
     n_groups = cfg["schedule"]["num_step_groups"]
     size = cfg["calibration"]["image_size"]
+
+    int16_layers = tuple(cfg.get("mixed_precision", {}).get("int16_weight_layers", ()))
+    if cfg.get("calibration", {}).get("sequential", False):
+        n = quantize_weights_in_place(model, int16_layers)
+        print(f"顺序标定：权重已预量化 {n} 层（INT16: {list(int16_layers) or '无'}）", flush=True)
 
     stats = {}
     for seed in cfg["calibration"]["seeds"]:
