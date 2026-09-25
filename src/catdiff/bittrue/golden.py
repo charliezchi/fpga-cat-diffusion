@@ -163,6 +163,11 @@ def main(argv: list[str] | None = None) -> int:
     (args.out_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=1), encoding="utf-8")
 
+    # ---- 包内 README（与 docs/quality-gates/f5-golden-readme.md 同源拷贝）----
+    readme_src = Path("docs/quality-gates/f5-golden-readme.md")
+    if readme_src.exists():
+        shutil.copyfile(readme_src, args.out_dir / "README.md")
+
     # ---- checksums ----
     with open(args.out_dir / "checksums.txt", "w", encoding="utf-8") as f:
         for path in sorted(args.out_dir.rglob("*")):
