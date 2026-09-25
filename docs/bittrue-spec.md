@@ -51,9 +51,9 @@ x0 预测被 clip 到 [-1,1]、prev_sample = √ᾱ_prev·x0 + √(1-ᾱ_prev)·
 ```
 acc[i] = Σ_j x_q[j] · w_q[i][j]        # INT8×INT8 或 INT16×INT16 → INT32 累加
 ```
-- 逐乘积 int（≤ 127×127 或 32767×127），累加用 INT32。最大通道和
-  （conv_out：3×9 项 ×32767×127 ≈ 1.1e8；conv_in 同级；内部层 9×512×127²≈6.6e7）
-  均远离 2^31，无需 INT64 累加。
+- 逐乘积 int（≤ 127×127 或 32767×127），累加用 INT32（**饱和到 ±(2^31-1)**，
+  RTL: DSP 级联累加的溢出饱和保护；真实标定轨迹下 acc ≤ ~1e8 远离 2^31，
+  此为防御性定义），累加中间积用 INT64。
 - FiLM 偏置（仅 ResnetBlock 的 conv1）：`acc[i] += film_q32[i]`（见 §5.1）。
 - 常规卷积偏置（weights.bin 的 fp32 bias）：**融合进 requant M/N 之外的
   b32 项**：`b32[i] = round_half_up(bias[i] / (s_in·s_w[i]))`（acc 域整数，
@@ -133,7 +133,12 @@ v3 的 51 处表定点只覆盖模块边界；层内整数化的 conv/GN/SiLU/�
 
 多输入算子（residual add、concat）的 scale 对齐规则：**各输入先 requant 到
 输出量化点的 scale（各自 M/N），饱和到 INT8 后相加，和再饱和到 INT8**
-（RTL 不做 int8 直加）。
+（RTL 不做 int8 直加）。**操作数 requant 饱和域为 INT16（±32767）、和再截
+INT8**：块出点 scale 按 |和| 标定，支路本身可超 ±127（相互抵消），若按 INT8
+逐操作数饱和会产生大误差（微网实测 max 20 LSB，改 INT16 域后消除）。
+无权重支路的恒等 requant（residual 的 x 支路、concat
+两输入、mid_block 容器双定点）的 M/N = scales_to_MN(s_from/s_to)，由导出包
+scale 确定性推导（与 M/N 下发表同一公式，测试钉死），不再单独下发。
 
 ## 5. 各算子整数流
 
@@ -144,10 +149,10 @@ h1  = silu_lut1( gn( x_in, norm1 ) )          # x_in: 表定点或 concat 点
 acc = conv1(h1) + film_q32 + b32              # film: §0/§7，acc 域累加器初值
 hid = requant(acc, → hidden 点)
 h2  = silu_lut2( gn( hid, norm2 ) )
-main= requant(conv2(h2), → 表定块出点)         # 直接对齐到 residual 输出点
-sc  = (有 conv_shortcut) requant(conv_shortcut(x_in), → 同点)
-      或 requant(x_in, → 同点)                 # 恒等支路也要 scale 对齐
-out = sat_int8(sc + main)                     # ← 表定块出点
+main= requant16(conv2(h2), → 表定块出点)       # INT16 饱和（§4 规则）
+sc  = (有 conv_shortcut) requant16(conv_shortcut(x_in), → 同点)
+      或 requant16(x_in, → 同点)               # 恒等支路也要 scale 对齐
+out = sat_int8(sc + main)                     # 相加后截 INT8 ← 表定块出点
 ```
 FiLM 表（film_table_<steps>.bin，fp32）离线量化到 conv1 acc 域：
 `film_q32[i] = round_half_up(film[i] / (s_silu1·s_w1[i]))`。FiLM 表替代了
@@ -173,8 +178,8 @@ e_ij = exp_lut[a_ij]                          # 4096 项 UINT16，Q1.14
 p_ij = min(255, (e_ij·R + 2^23) >> 24)        # R = round_half_up(2^32 / Σ_j e_ij)
 acc_i = Σ_j p_ij·v_j                          # UINT8×INT8 → INT32，**无偏置补偿**
 av  = requant(acc_i, → <attn>.av 点, pre=1/256)  # 256 折进 ratio（§2.2）
-o   = requant(to_out(av), → 表定 attention 出点)
-res = requant(x_in, → 同点)
+o   = requant16(to_out(av), → 表定 attention 出点)
+res = requant16(x_in, → 同点)
 out = sat_int8(o + res)
 ```
 - exp LUT：`entry[a] = sat_u16(round_half_up(e^(-a·2^-8)·2^14))`，Δ=2^-8 定死，
@@ -283,7 +288,10 @@ artifacts/f5/golden/
 
 1. requant/原语单测全绿（负值舍入、饱和、int32 边界、softmax 全零行、GN 单元素）；
 2. Task 3 GN 误差预算：≤1 LSB 占比 ≥99.9%，无 >4 LSB（否则 fp32 IP 降级回写 §3）；
-3. Task 4 逐层对齐：与 fake-quant 相比块输出 ≤2 LSB（INT8 域）占比 >99%；
+3. Task 4 逐层对齐：与 fake-quant 相比，非注意力下游块输出 ≤2 LSB（INT8 域）
+   占比 >99%；注意力块及其下游因 uint8-softmax（±0.5/256 概率量化）与 int8 V
+   （fake-quant 内部为 float，位真按契约 int8）的固有扰动，判据放宽为
+   ≤8 LSB 占比 >99%（微网实测；最终以 §9.4 图像级 PSNR 仲裁）；
    最终 eps 分布以 conv_out 的 **INT8 基准格**（1 LSB = s8）报告
    （int16 域 LSB = s8/258，作浮点级参考同时报告）；
 4. Task 5 机器标准：位真批次 vs F4 签字批次逐张 PSNR ≥ 30 dB，

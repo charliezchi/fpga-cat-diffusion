@@ -42,7 +42,7 @@ _X_POINT = "@x"
 
 
 def _point_index(g) -> dict[str, int]:
-    order = list(g.tabled_points) + list(g.internal_points)
+    order = list(g.tabled_points) + list(g.internal_points) + [_X_POINT]
     return {name: i for i, name in enumerate(order)}
 
 
@@ -95,7 +95,8 @@ def _write_requant_params(path: Path, g, tabled: dict, internal: dict,
             f.write(struct.pack("<H", len(nb)) + nb)
             f.write(np.array(internal[name], dtype="<f4").tobytes())
         for name, ref in layer_refs.items():
-            rec = weights[name]
+            rec = weights.get(name)  # av_requant 伪层无权重记录
+            assert ref.kind == KIND_AV or rec is not None, name
             in_kind = (P_X if ref.in_point == _X_POINT else
                        (P_INTERNAL if ref.in_point in g.internal_points
                         else P_TABLED))
@@ -153,29 +154,10 @@ def _write_requant_params(path: Path, g, tabled: dict, internal: dict,
     return n_layers
 
 
-@torch.no_grad()
-def _calibrate_internal(config: dict, unet_cfg: dict, tabled_raw: dict, g,
-                        seeds: list[int], size: int, percentile: float,
-                        subsample: int) -> dict[str, list[float]]:
-    """在 fake-quant 轨迹上采集内部点统计（协议同 F4）+ 记录 DDIM x max|x|。"""
-    model = load_handwritten_unet(config["model_id"], unet_cfg)
-    n_steps = config["schedule"]["num_inference_steps"]
-    n_groups = config["schedule"]["num_step_groups"]
-    mixed = config.get("mixed_precision", {})
-    int16_layers = tuple(mixed.get("int16_weight_layers", ()))
-    quantize_weights_in_place(model, int16_layers)
-
-    raw = {k: {int(gg): v for gg, v in groups.items()}
-           for k, groups in tabled_raw.items()}
-    ctx = FakeQuantContext(raw, n_steps, n_groups,
-                           int16_weight_layers=int16_layers,
-                           int16_act_layers=tuple(mixed.get(
-                               "int16_act_layers", ())))
-    apply_fake_quant(model, ctx)
-
+def register_observers(model, g, per_step: dict, step_box: list,
+                        subsample: int) -> list:
+    """按接线图在内部点注册统计 hook（fwd=输出 / pre=输入）。"""
     mods = dict(model.named_modules())
-    per_step: dict = {}
-    step_box = [0]
     handles = []
 
     def reg(module_name: str, kind: str, point: str) -> None:
@@ -196,6 +178,30 @@ def _calibrate_internal(config: dict, unet_cfg: dict, tabled_raw: dict, g,
 
     for name, kind, point in g.observers:
         reg(name, kind, point)
+    return handles
+
+
+@torch.no_grad()
+def _calibrate_internal(config: dict, unet_cfg: dict, tabled_raw: dict, g,
+                        seeds: list[int], size: int, percentile: float,
+                        subsample: int) -> dict[str, list[float]]:
+    """在 fake-quant 轨迹上采集内部点统计（协议同 F4）+ 记录 DDIM x max|x|。"""
+    model = load_handwritten_unet(config["model_id"], unet_cfg)
+    n_steps = config["schedule"]["num_inference_steps"]
+    n_groups = config["schedule"]["num_step_groups"]
+    mixed = config.get("mixed_precision", {})
+    int16_layers = tuple(mixed.get("int16_weight_layers", ()))
+    quantize_weights_in_place(model, int16_layers)
+
+    raw = {k: {int(gg): v for gg, v in groups.items()}
+           for k, groups in tabled_raw.items()}
+    ctx = FakeQuantContext(raw, n_steps, n_groups,
+                           int16_weight_layers=int16_layers,
+                           int16_act_layers=tuple(mixed.get(
+                               "int16_act_layers", ())))
+    apply_fake_quant(model, ctx)
+
+    handles = register_observers(model, g, per_step := {}, [0], subsample)
 
     x_max = 0.0
     for seed in seeds:

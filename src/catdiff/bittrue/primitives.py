@@ -45,10 +45,26 @@ def requant(acc, M, N, bits: int = 8):
     """
     acc = np.asarray(acc, dtype=np.int64)
     M = np.asarray(M, dtype=np.int64)
-    if N <= 0:
-        shifted = acc * M
-    else:
-        shifted = (acc * M + (1 << (N - 1))) >> N
+    N_arr = np.asarray(N, dtype=np.int64)
+    # 逐通道向量沿 axis=1 广播到 (N,C,H,W)/(N,C)
+    if M.ndim == 1:
+        if acc.ndim == 3 and acc.shape[0] == M.shape[0]:
+            M = M.reshape(-1, 1, 1)
+            N_arr = N_arr.reshape(-1, 1, 1)
+        elif acc.ndim >= 2 and acc.shape[1] == M.shape[0]:
+            tail = (1,) * (acc.ndim - 2)
+            M = M.reshape(1, -1, *tail)
+            N_arr = N_arr.reshape(1, -1, *tail)
+    if N_arr.ndim == 0:
+        n = int(N_arr)
+        if n <= 0:
+            shifted = acc * M
+        else:
+            shifted = (acc * M + (1 << (n - 1))) >> n
+    else:  # 逐通道 N（含 0：不移位不舍入）
+        off = np.where(N_arr > 0, (1 << np.maximum(N_arr - 1, 0)), 0)
+        shifted = np.where(N_arr > 0, (acc * M + off) >> np.maximum(N_arr, 0),
+                           acc * M)
     return sat_int(shifted, bits)
 
 
@@ -97,6 +113,7 @@ def int_conv2d(x_q: torch.Tensor, w_q: torch.Tensor, M, N,
     acc = F.conv2d(xf, w_q.to(torch.float64), stride=stride)
     if bias32 is not None:
         acc = acc + bias32.to(torch.float64).view(1, -1, 1, 1)
+    acc = _sat32(acc)  # INT32 累加器饱和（契约 §2.1）
     return _requant_channels(acc, M, N, out_bits)
 
 
@@ -107,7 +124,13 @@ def int_linear(x_q: torch.Tensor, w_q: torch.Tensor, M, N,
     acc = xf @ w_q.to(torch.float64).T
     if bias32 is not None:
         acc = acc + bias32.to(torch.float64)
+    acc = _sat32(acc)
     return _requant_channels(acc, M, N, out_bits)
+
+
+def _sat32(acc: torch.Tensor) -> torch.Tensor:
+    """INT32 累加器饱和（RTL 溢出保护；模拟器容器为 float64/int64）。"""
+    return torch.clamp(acc, -(2**31 - 1), 2**31 - 1)
 
 
 def _pad_tuple(pad):
@@ -204,6 +227,10 @@ def groupnorm_int(x_q: np.ndarray, num_groups: int, eps_q: int,
 
     y = sat_i8(((x̂·Gc + 2^(Nc-1)) >> Nc) + Bq)，x̂ = sat16((d·inv + 2^9) >> 10)。
     """
+    if x_q.ndim == 4:          # (N,C,H,W)：本项目 batch=1，兼容保留
+        assert x_q.shape[0] == 1
+        return groupnorm_int(x_q[0], num_groups, eps_q, lut0, lut1,
+                             Gc, Nc, Bq)[None]
     C, H, W = x_q.shape
     G = num_groups
     ch_per_g = C // G
