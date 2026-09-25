@@ -26,3 +26,6 @@ Desktop.ini
 # M0 Python 工程补充（spec §3：采样产物不入库）
 artifacts/
 dist/
+
+# F4 导出大文件不进 git（见 docs/quant-format.md；按需走 Release）
+export/*.bin
