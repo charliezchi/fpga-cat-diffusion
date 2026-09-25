@@ -1,7 +1,8 @@
 """手写 DDIM(eta=0) 调度器，复刻 diffusers DDIMScheduler 的数值行为。
 
 仅实现本项目所需子集：epsilon 预测、linear beta、eta=0、
-use_clipped_model_output=False（clip_sample 不生效）。
+use_clipped_model_output=False（方向项用原始 model_output；
+clip_sample=True 时对 pred_x0 做 [-1,1] 截断，与 diffusers 默认行为一致）。
 """
 
 import types
