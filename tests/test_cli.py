@@ -40,3 +40,36 @@ def test_cli_writes_metadata(tmp_path, monkeypatch, tiny_unet, tiny_scheduler):
     assert meta["num_inference_steps"] == 2
     config = json.loads((out / "config.json").read_text(encoding="utf-8"))
     assert config["sample_size"] == 32
+
+
+def test_cli_handwritten_backend(tmp_path, monkeypatch, tiny_handwritten_unet,
+                                 tiny_scheduler):
+    import json as _json
+
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(_json.dumps({"stub": True}))
+    monkeypatch.setattr(cli, "load_handwritten_unet",
+                        lambda model_id, config: tiny_handwritten_unet)
+    monkeypatch.setattr(cli, "HwDDIMScheduler",
+                        lambda num_train_timesteps=1000: tiny_scheduler(2))
+    out = tmp_path / "run_hw"
+    rc = cli.main([
+        "--model-id", "tiny", "--backend", "handwritten",
+        "--config", str(cfg), "--strip-attention", "all",
+        "--num-samples", "2", "--image-size", "32",
+        "--num-inference-steps", "2", "--seed", "5", "--out-dir", str(out),
+    ])
+    assert rc == 0
+    meta = json.loads((out / "metadata.json").read_text(encoding="utf-8"))
+    assert meta["backend"] == "handwritten"
+    assert meta["strip_attention"] == "all"
+
+
+def test_cli_strip_attention_requires_handwritten(tmp_path):
+    import pytest
+
+    with pytest.raises(SystemExit):
+        cli.main([
+            "--model-id", "tiny", "--strip-attention", "all",
+            "--num-samples", "1", "--out-dir", str(tmp_path / "x"),
+        ])

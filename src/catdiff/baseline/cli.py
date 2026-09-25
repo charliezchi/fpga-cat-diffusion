@@ -13,6 +13,9 @@ import torch
 from PIL import Image
 
 from .sampling import load_ddim, load_unet, make_grid, sample_batch, tensor_to_pil
+from catdiff.model.ablate import strip_attention
+from catdiff.model.ddim import DDIMScheduler as HwDDIMScheduler
+from catdiff.model.unet import as_diffusers_output, load_handwritten_unet
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -24,11 +27,31 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--num-inference-steps", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--cols", type=int, default=4)
+    p.add_argument("--backend", choices=["diffusers", "handwritten"],
+                   default="diffusers")
+    p.add_argument("--config", type=Path, default=None,
+                   help="handwritten 后端所需的 UNet config json")
+    p.add_argument("--strip-attention", choices=["none", "all", "keep-mid"],
+                   default="none", help="注意力消融（仅 handwritten 后端）")
     args = p.parse_args(argv)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    model = load_unet(args.model_id)
-    scheduler = load_ddim(args.model_id, args.num_inference_steps)
+    if args.strip_attention != "none" and args.backend != "handwritten":
+        p.error("--strip-attention 仅 handwritten 后端支持")
+    if args.backend == "handwritten":
+        if args.config is None:
+            p.error("--backend handwritten 需要 --config")
+        cfg = json.loads(args.config.read_text(encoding="utf-8"))
+        hw_model = load_handwritten_unet(args.model_id, cfg)
+        if args.strip_attention != "none":
+            n = strip_attention(hw_model, keep_mid=args.strip_attention == "keep-mid")
+            print(f"注意力消融：{args.strip_attention}，替换 {n} 处")
+        model = as_diffusers_output(hw_model)
+        scheduler = HwDDIMScheduler(num_train_timesteps=1000)
+        scheduler.set_timesteps(args.num_inference_steps)
+    else:
+        model = load_unet(args.model_id)
+        scheduler = load_ddim(args.model_id, args.num_inference_steps)
 
     t0 = time.time()
     generated = 0
@@ -52,7 +75,11 @@ def main(argv: list[str] | None = None) -> int:
     make_grid(images, args.cols).save(args.out_dir / "grid.png")
 
     (args.out_dir / "config.json").write_text(
-        json.dumps(dict(model.config), indent=2, default=str), encoding="utf-8"
+        json.dumps(
+            model.config if isinstance(model.config, dict) else vars(model.config),
+            indent=2, default=str,
+        ),
+        encoding="utf-8",
     )
     (args.out_dir / "metadata.json").write_text(
         json.dumps(
@@ -68,6 +95,8 @@ def main(argv: list[str] | None = None) -> int:
                 "torch": torch.__version__,
                 "diffusers": diffusers.__version__,
                 "python": platform.python_version(),
+                "backend": args.backend,
+                "strip_attention": args.strip_attention,
             },
             indent=2,
         ),
