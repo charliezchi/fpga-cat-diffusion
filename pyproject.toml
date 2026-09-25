@@ -23,3 +23,7 @@ packages = ["src/catdiff"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: 需要 HF 缓存真实权重、分钟级耗时的集成测试（用 uv run pytest -m slow 运行）",
+]
