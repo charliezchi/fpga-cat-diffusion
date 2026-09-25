@@ -17,9 +17,17 @@ class UNet2D(nn.Module):
         layers = config["layers_per_block"]
         groups = config["norm_num_groups"]
         time_embed_dim = chs[0] * 4
+        # 以下键缺省即 cat-256 配置族（docs/reference/unet-config-ddpm-cat-256.json）；
+        # butterflies-64 经 config 显式给出不同值
+        freq_shift = config.get("freq_shift", 1)
+        flip_sin_to_cos = config.get("flip_sin_to_cos", False)
+        attention_head_dim = config.get("attention_head_dim", None)
+        downsample_padding = config.get("downsample_padding", 0)
+        eps = config.get("norm_eps", 1e-6)
 
         self.conv_in = nn.Conv2d(config["in_channels"], chs[0], 3, padding=1)
-        self.time_proj = Timesteps(chs[0])
+        self.time_proj = Timesteps(chs[0], flip_sin_to_cos=flip_sin_to_cos,
+                                   downscale_freq_shift=freq_shift)
         self.time_embedding = TimestepEmbedding(chs[0], time_embed_dim)
 
         self.down_blocks = nn.ModuleList()
@@ -30,10 +38,14 @@ class UNet2D(nn.Module):
                 cin, cout, time_embed_dim, layers, groups,
                 add_downsample=i < len(chs) - 1,
                 with_attention="Attn" in block_type,
+                attention_head_dim=attention_head_dim,
+                downsample_padding=downsample_padding,
+                eps=eps,
             ))
             cin = cout
 
-        self.mid_block = MidBlock(chs[-1], time_embed_dim, groups)
+        self.mid_block = MidBlock(chs[-1], time_embed_dim, groups,
+                                  attention_head_dim=attention_head_dim, eps=eps)
 
         self.up_blocks = nn.ModuleList()
         rchs = list(reversed(chs))
@@ -45,10 +57,12 @@ class UNet2D(nn.Module):
                 cin_skip, cout, prev_out, time_embed_dim, layers + 1, groups,
                 add_upsample=i < len(chs) - 1,
                 with_attention="Attn" in block_type,
+                attention_head_dim=attention_head_dim,
+                eps=eps,
             ))
             prev_out = cout
 
-        self.conv_norm_out = nn.GroupNorm(groups, chs[0], eps=1e-6)
+        self.conv_norm_out = nn.GroupNorm(groups, chs[0], eps=eps)
         self.conv_act = nn.SiLU()
         self.conv_out = nn.Conv2d(chs[0], config["out_channels"], 3, padding=1)
 
