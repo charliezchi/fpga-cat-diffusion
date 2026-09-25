@@ -8,7 +8,8 @@
 > 修订记录：v1.0 初版。与实施计划的两处偏差（均有依据）：
 > ① GN eps 用 **1e-6**（模型 config `norm_eps=1e-6` 实测，计划文本"1e-5"有误）；
 > ② conv_in 输入 x 定死 **s_x = 2^-12（Q3.12 存储，表示域 ±8）**，
->    实测 DDIM 轨迹 max|x| 记录于 artifacts/f5/export-requant 运行日志。
+>    实测 DDIM 轨迹 max|x| = **5.4684**（8 seeds × 50 步标定运行日志
+>    artifacts/f5-export-requant-50.log），裕量 1.46×。
 
 ## 0. 总则
 

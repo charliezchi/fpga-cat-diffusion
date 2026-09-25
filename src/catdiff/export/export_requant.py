@@ -94,6 +94,7 @@ def _write_requant_params(path: Path, g, tabled: dict, internal: dict,
             nb = name.encode()
             f.write(struct.pack("<H", len(nb)) + nb)
             f.write(np.array(internal[name], dtype="<f4").tobytes())
+        # @meta 等非点键不写入文件
         for name, ref in layer_refs.items():
             rec = weights.get(name)  # av_requant 伪层无权重记录
             assert ref.kind == KIND_AV or rec is not None, name
@@ -222,7 +223,10 @@ def _calibrate_internal(config: dict, unet_cfg: dict, tabled_raw: dict, g,
           flush=True)
     merged = merge_step_stats(per_step, n_steps, n_groups)
     scales = finalize_scales(merged, percentile)
-    return {k: [v for _, v in sorted(gr.items())] for k, gr in scales.items()}
+    out = {k: [v for _, v in sorted(gr.items())] for k, gr in scales.items()}
+    out["@meta"] = {"x_max": round(x_max, 4), "seeds": seeds,
+                    "num_steps": n_steps}
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -257,13 +261,23 @@ def main(argv: list[str] | None = None) -> int:
     print(f"norm_params.bin：{n_gn} 个 GN", flush=True)
     del model
 
-    t0 = time.time()
-    internal = _calibrate_internal(
-        cfg, unet_cfg, tabled_raw, g, bt["internal_calibration"]["seeds"],
-        bt["internal_calibration"]["image_size"],
-        bt["internal_calibration"]["percentile"],
-        bt["internal_calibration"]["subsample"])
-    print(f"内部点标定耗时 {time.time() - t0:.0f}s", flush=True)
+    cache = args.out_dir / f"internal_scales_{args.table_suffix}.json"
+    if cache.exists():
+        data = json.loads(cache.read_text(encoding="utf-8"))
+        internal = data["internal"]
+        print(f"内部点 scale 复用缓存 {cache}（meta: "
+              f"{data['internal'].get('@meta')}）", flush=True)
+    else:
+        t0 = time.time()
+        internal = _calibrate_internal(
+            cfg, unet_cfg, tabled_raw, g, bt["internal_calibration"]["seeds"],
+            bt["internal_calibration"]["image_size"],
+            bt["internal_calibration"]["percentile"],
+            bt["internal_calibration"]["subsample"])
+        print(f"内部点标定耗时 {time.time() - t0:.0f}s", flush=True)
+        cache.write_text(json.dumps({
+            "internal": internal,
+        }, indent=1), encoding="utf-8")
 
     tabled = build_act_scales(tabled_raw)
     out = args.out_dir / f"requant_params_{args.table_suffix}.bin"
