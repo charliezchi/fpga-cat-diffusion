@@ -1,0 +1,45 @@
+{
+  "export_dir": "artifacts/f4/export-v3",
+  "tiers": {
+    "50": {
+      "act_scales": "act_scales_50.json",
+      "ddim_table": "ddim_table_50.json",
+      "film_table": "film_table_50.bin",
+      "film_index": "film_index_50.json",
+      "requant_params": "requant_params_50.bin"
+    },
+    "20": {
+      "act_scales": "act_scales_20.json",
+      "ddim_table": "ddim_table_20.json",
+      "film_table": "film_table_20.bin",
+      "film_index": "film_index_20.json",
+      "requant_params": "requant_params_20.bin"
+    }
+  },
+  "norm_params": "norm_params.bin",
+  "s_x": 0.000244140625,
+  "x_clip_grid": 4096,
+  "golden_steps": { "50": [0, 25, 49], "20": [0, 10, 19] },
+  "lut": {
+    "silu_bits": 8,
+    "exp_entries": 4096,
+    "exp_log2_delta": -8,
+    "exp_frac_bits": 14,
+    "rsqrt_entries_per_parity": 2048,
+    "rsqrt_mantissa_bits": 11,
+    "rsqrt_var_min_q16": 256,
+    "rsqrt_out_frac_bits": 14,
+    "xhat_frac_bits": 12,
+    "newton_iterations": 0
+  },
+  "requant": {
+    "mantissa_min_exp": 30,
+    "max_shift": 62
+  },
+  "internal_calibration": {
+    "seeds": [200, 201, 202, 203, 204, 205, 206, 207],
+    "image_size": 256,
+    "percentile": 99.95,
+    "subsample": 2048
+  }
+}
