@@ -1,4 +1,4 @@
-"""INT8 fake-quant 采样：DDIM-20 @256×256，产出画质关卡样本。"""
+"""INT8 fake-quant 采样（v3 契约）：按 config 步数与混合精度规则产出画质关卡样本。"""
 
 from __future__ import annotations
 
@@ -33,9 +33,13 @@ def main(argv: list[str] | None = None) -> int:
 
     model = load_handwritten_unet(cfg["model_id"], unet_cfg)
     n_steps = cfg["schedule"]["num_inference_steps"]
-    ctx = FakeQuantContext(scales, n_steps, cfg["schedule"]["num_step_groups"])
+    mixed = cfg.get("mixed_precision", {})
+    ctx = FakeQuantContext(scales, n_steps, cfg["schedule"]["num_step_groups"],
+                           int16_weight_layers=mixed.get("int16_weight_layers", ()),
+                           int16_act_layers=mixed.get("int16_act_layers", ()))
     n = apply_fake_quant(model, ctx)
-    print(f"fake-quant 施加 {n} 处")
+    print(f"fake-quant 施加 {n} 处（W16: {mixed.get('int16_weight_layers', [])}，"
+          f"A16: {mixed.get('int16_act_layers', [])}）")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -59,6 +63,9 @@ def main(argv: list[str] | None = None) -> int:
     make_grid(images, 4).save(args.out_dir / "grid.png")
     (args.out_dir / "metadata.json").write_text(json.dumps({
         "backend": "handwritten-int8-fakequant",
+        "scheme": "internal W8A8; "
+                  f"W16 on {mixed.get('int16_weight_layers', [])}; "
+                  f"A16 on {mixed.get('int16_act_layers', [])}",
         "quant_config": cfg, "seed": args.seed,
         "num_samples": args.num_samples,
         "elapsed_s": round(time.time() - t0, 1),
