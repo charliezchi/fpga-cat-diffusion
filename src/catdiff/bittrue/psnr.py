@@ -30,14 +30,21 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     rows = []
+    missing = []
     for idx in range(args.num):
         name = f"seed{args.seed}_{idx:04d}.png"
         pa, pb = args.a / name, args.b / name
         if not pa.exists() or not pb.exists():
-            raise FileNotFoundError(f"{pa} 或 {pb} 缺失")
+            missing.append(name)
+            continue
         ia = np.asarray(Image.open(pa).convert("RGB"))
         ib = np.asarray(Image.open(pb).convert("RGB"))
         rows.append({"image": name, "psnr_db": round(psnr(ia, ib), 2)})
+    if missing:
+        print(f"跳过缺失 {len(missing)} 张: {missing[:5]}...")
+        print(f"已对比 {len(rows)} 张")
+    if not rows:
+        return 1
     vals = [r["psnr_db"] for r in rows]
     summary = {"dir_a": str(args.a), "dir_b": str(args.b),
                "min": min(vals), "mean": round(float(np.mean(vals)), 2),

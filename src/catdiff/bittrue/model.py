@@ -69,6 +69,9 @@ class BittrueUNet:
             del skips[-(self.lpb + 1):]
             x = self._up_block(u, x, list(reversed(take)), ctx, trace,
                                trace_in)
+        # 末端：conv_norm_out(GN) → SiLU → conv_out（镜像 model/unet.py.forward）
+        x = self._gn("conv_norm_out", x, ctx)
+        x = self._silu("conv_norm_out.gn", "conv_norm_out.silu", x, ctx)
         eps = self._conv_out(x, ctx)
         if trace is not None:
             trace["conv_out"] = eps
@@ -212,13 +215,14 @@ class BittrueUNet:
 
     def _down_block(self, b: int, x: np.ndarray, ctx: _StepCtx,
                     trace: dict | None, trace_in: dict | None):
+        skips = []
         for i in range(self.lpb):
             x = self._resnet(f"down_blocks.{b}.resnets.{i}", x, None, ctx,
                              trace, trace_in)
             a = f"down_blocks.{b}.attentions.{i}"
             if a in self.g.attentions:
                 x = self._attention(a, x, ctx, trace, trace_in)
-        skips = [x]
+            skips.append(x)  # 每层一个（点注意力后输出），镜像 DownBlock.forward
         if b < self.n_down - 1:
             name = f"down_blocks.{b}.downsamplers.0"
             if trace_in is not None:

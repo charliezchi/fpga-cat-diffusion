@@ -239,8 +239,9 @@ def test_bittrue_vs_fakequant_tiny(tiny_bundle):
     s16 = scales["conv_out"][0] * 127.0 / 32767.0
     fq_eps = np.round(trace["conv_out"].detach().cpu().numpy() / s16)
     diff_eps = np.abs(fq_eps - trace_bt["conv_out"]) / 258.0  # → int8 等效
-    frac_eps = float((diff_eps <= 64).mean())
-    corr = float(np.corrcoef(fq_eps.flatten().astype(np.float64),
-                             trace_bt["conv_out"].flatten().astype(np.float64))[0, 1])
-    print(f"eps(int8等效): <=64 frac {frac_eps:.4f} max {diff_eps.max():.1f} corr {corr:.4f}")
-    assert frac_eps > 0.99 and corr > 0.7
+    frac_eps = float((diff_eps <= 16).mean())
+    bt_f = trace_bt["conv_out"].flatten().astype(np.float64)
+    fq_f = fq_eps.flatten().astype(np.float64)
+    gain = float(np.dot(bt_f, fq_f) / np.dot(fq_f, fq_f))
+    print(f"eps(int8等效): <=16 frac {frac_eps:.4f} max {diff_eps.max():.1f} gain {gain:.3f}")
+    assert frac_eps > 0.99 and 0.9 <= gain <= 1.1

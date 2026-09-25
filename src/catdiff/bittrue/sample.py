@@ -36,6 +36,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--num-samples", type=int, default=20)
     p.add_argument("--seed", type=int, default=100)
+    p.add_argument("--shard", type=int, default=0,
+                   help="并行分片号：只处理 idx %% num_shards == shard 的图")
+    p.add_argument("--num-shards", type=int, default=1)
     args = p.parse_args(argv)
 
     bt_cfg = json.loads(Path(args.bittrue_config).read_text(encoding="utf-8"))
@@ -51,7 +54,9 @@ def main(argv: list[str] | None = None) -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     t_start = time.time()
     x_max_overall = 0.0
-    for idx in range(args.num_samples):
+    indices = [i for i in range(args.num_samples)
+               if i % args.num_shards == args.shard]
+    for idx in indices:
         path = args.out_dir / f"seed{args.seed}_{idx:04d}.png"
         if path.exists():
             continue
@@ -72,9 +77,8 @@ def main(argv: list[str] | None = None) -> int:
         Image.fromarray(np.transpose(pixels, (1, 2, 0))).save(path)
         print(f"[{idx + 1}/{args.num_samples}] {path.name} 完成", flush=True)
 
-    images = [Image.open(args.out_dir / f"seed{args.seed}_{idx:04d}.png")
-              for idx in range(args.num_samples)]
-    make_grid(images, 4).save(args.out_dir / "grid.png")
+    if args.shard == 0:
+        _make_grid(args)
     (args.out_dir / "metadata.json").write_text(json.dumps({
         "backend": "bittrue-int-sim", "tier": args.tier, "seed": args.seed,
         "num_samples": args.num_samples,
@@ -83,6 +87,16 @@ def main(argv: list[str] | None = None) -> int:
     }, indent=2), encoding="utf-8")
     print(f"完成：{args.out_dir}（max|x|={x_max_overall}）", flush=True)
     return 0
+
+
+def _make_grid(args) -> None:
+    import itertools
+    paths = sorted(args.out_dir.glob(f"seed{args.seed}_*.png"))
+    if len(paths) < args.num_samples:
+        return  # 未齐不拼图
+    from catdiff.baseline.sampling import make_grid
+    images = [Image.open(p_) for p_ in paths[:args.num_samples]]
+    make_grid(images, 4).save(args.out_dir / "grid.png")
 
 
 if __name__ == "__main__":
