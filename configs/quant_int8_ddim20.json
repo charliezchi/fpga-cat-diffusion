@@ -2,7 +2,11 @@
   "weight_quant": {"type": "per_channel_symmetric_int8", "axis": 0},
   "act_quant": {"type": "per_tensor_symmetric_int8", "percentile": 99.95},
   "schedule": {"num_inference_steps": 20, "num_step_groups": 10},
-  "calibration": {"seeds": [200, 201, 202, 203, 204, 205, 206, 207], "image_size": 256},
+  "calibration": {"seeds": [200, 201, 202, 203, 204, 205, 206, 207], "image_size": 256, "sequential": true},
+  "mixed_precision": {
+    "int16_weight_layers": ["conv_in", "conv_out"],
+    "int16_act_layers": ["conv_out"]
+  },
   "model_id": "google/ddpm-cat-256",
   "unet_config": "docs/reference/unet-config-ddpm-cat-256.json"
 }
