@@ -2,6 +2,7 @@ import torch
 from torch import nn
 
 from catdiff.quant.calibrate import (step_to_group, finalize_scales,
+                                     merge_step_stats,
                                      quantize_weights_in_place,
                                      update_percentile_stats)
 from catdiff.model.unet import UNet2D
@@ -35,6 +36,18 @@ def test_stats_finalize_uses_percentile():
     assert s > 0
     # scale = P99.9(|a|)/127，应明显大于 std=3 的 1 倍
     assert s * 127 > 3.0
+
+
+def test_merge_step_stats_concatenates_group_steps():
+    per_step = {"L": {s: [s] * 3 for s in range(6)}}
+    merged = merge_step_stats(per_step, num_steps=6, num_groups=3)
+    assert merged["L"][0] == [0, 0, 0, 1, 1, 1]
+    assert merged["L"][1] == [2, 2, 2, 3, 3, 3]
+    assert merged["L"][2] == [4, 4, 4, 5, 5, 5]
+    # 缺步容忍：末步缺失时归并不报错
+    partial = {"L": {s: [1.0] for s in range(5)}}
+    merged = merge_step_stats(partial, num_steps=6, num_groups=3)
+    assert sum(merged["L"][g] == [1.0] * 2 for g in range(3)) == 2
 
 
 def test_quantize_weights_in_place_mixed_bits():
