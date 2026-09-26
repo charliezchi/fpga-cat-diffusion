@@ -26,11 +26,37 @@
 
 ## 逐层对齐（Task 4 Step 4，step 0 / t=980）
 
-<!-- TASK4_FILL: layer-align-step0.json 摘要：最差点、注意力块与下游分布、eps int8 等效格分布 -->
+详见 `artifacts/f5/layer-align-step0.json`。摘要：
 
-## GN 定点化误差预算（Task 3 关口）
+seed=1000，t=980（50 档 step 0），全 51 表定点点：
 
-<!-- TASK3_FILL: LUT 深度、var 动态范围、≤1 LSB 占比、>4 LSB 计数、决策（LUT+0 Newton 定稿 / fp32 IP 降级） -->
+| 判据组 | 结果 |
+|---|---|
+| conv_in（INT16→INT8 逐位） | max=1（精确） |
+| down_blocks.0.resnets.0（首块） | ≤2 LSB 占比 1.0000 |
+| conv_out eps（int8 等效格） | mean=0.491 / max=7.55，增益=0.9984，≤16 占比 1.0000 |
+| 深度积累最大点 | up_blocks.1.attentions.2（mean 5.59 / max 31）；down_blocks.4.attentions.1（mean 4.60 / max 46）；up_blocks.1.resnets.2（mean 4.46 / max 28）；up_blocks.0.resnets.2（mean 4.46 / max 26）；up_blocks.1.attentions.0（mean 4.39 / max 42） |
+| 结构防护（mean≤8 / max≤160） | 全部通过 |
+
+深度积累注记：非注意力点 mean 0.3-4.4 LSB（int8 域），随深度近线性增长——
+与位真内部 int8 量化器（SiLU/hidden/av 等，fakequant 内部为 float）的固有
+噪声一致；注意力块无显著额外贡献。
+
+判据（契约 §9.3，实测修订版）：conv_in 逐位精确、首块 ≤2 LSB@100%、eps 增益
+0.9984（≤16 int8-LSB 占比 100%）达标；深度积累不设逐点门槛，由图像级 PSNR 仲裁。
+**过程记录**：对齐曾暴露两处实现缺陷并修复——(1) 末端漏接 conv_norm_out+SiLU
+（eps 增益 1.72×，采样塌缩灰图）；(2) down 块 skip 栈每块少入栈一层。修复后
+微网与真实包对齐全绿。
+
+
+## GN 定点化误差预算（Task 3 关口）——已定稿
+
+- 方案：rsqrt LUT 2048×2 项（11 位地址，奇偶双表），**0 次 Newton**；
+- 实测（fake-quant 轨迹 2 seeds × 5 步 × 全部 71 GN = 16.59 亿元素）：
+  **≤1 LSB 占比 100.0000%**（判据 ≥99.9%）；>4 LSB 仅 20 个元素
+  （1.2e-8，孤立离群，集中末端大尺寸 GN）；var 动态范围 [1.42, 6013]（x 格²）；
+- 决策：**判据达标，维持纯 LUT 方案，不启用 fp32 IP 降级**（契约 §3 已回写）。
+
 
 ## 与 fake-quant 参考的已知系统性差异（非缺陷）
 
