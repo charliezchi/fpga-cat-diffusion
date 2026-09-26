@@ -174,8 +174,7 @@ class TestSoftmax:
         p = softmax_uint8(scores, Kexp, Qe, lut)
         assert p.shape == scores.shape
         assert p.min() >= 0 and p.max() <= 65535
-        assert np.allclose(p.sum(axis=1), 256 * np.ones(4), atol=0) or \
-            p.max() == 256 // 8
+        assert p.max() == 65536 // 8  # 均匀概率 1/8 → 8192
 
     def test_dominant_row(self):
         lut = gen_exp_lut()
