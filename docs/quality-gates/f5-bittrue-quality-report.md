@@ -1,9 +1,31 @@
 # F5 位真画质关卡报告（M0 关口）
 
 > 方案：v3 混合精度（契约 `docs/quant-format.md` v3）+ 位真契约
-> `docs/bittrue-spec.md` v1.0。位真模拟器 `src/catdiff/bittrue/` 只消费
-> `artifacts/f4/export-v3/` 导出包（含 F5 扩展 requant_params/norm_params）。
+> `docs/bittrue-spec.md` **v1.4**。位真模拟器 `src/catdiff/bittrue/` 只消费
+> `artifacts/f4/export-v3/` 导出包（含 F5 扩展 requant_params/norm_params，
+> 内部点标定裕量 margin=1.5）。
 > 本报告为机器观测；**签字后 M0 关闭**。
+
+## v1.4 坍缩根因与修复（2026-09-27 定论）
+
+v1.1-v1.3 重采样图像对比度系统性坍缩（std ~19.5 vs F4 批次 33.4，PSNR ~24 dB）。
+根因实验链（E1-E5 + 逐组件消融 + 同输入逐点散度）：
+
+1. **机理**：同输入下位真 vs fake-quant 的 eps 差异含 ~1.33% 逐步**新鲜**正交
+   噪声，被去噪器反复"清理"，轨迹回归数据集均值，晚期步加速（E4 注入 1.4%
+   新鲜噪声完美复现坍缩；E5 容限：0.7%→29.3 dB、0.35%→36.8 dB）。
+2. **首要来源**：residual 恒等支路（无 conv_shortcut 的 x 支路）细格实现按
+   INT18 饱和（±127.99 int8 等效），而深层块（down_blocks.2/3/4）支路码常态
+   ±130-198 s8——削波产生 max ~70 LSB 单点误差（同输入逐点散度实验钉死，
+   探针 `artifacts/debug/f5_probe.py`）。
+3. **次要来源**：residual 粗格双重舍入（≤1 LSB/块）；内部点 P99.95 削波
+   （贡献 ~0.37pct 噪声）。
+4. **修复（契约 v1.4）**：residual 两支路 requant 到出点细子格（s8/1024）、
+   **INT19 饱和（±255.99 int8 等效）**、细子格域相加、一次舍入截 INT8；
+   内部点标定裕量 margin=1.5。
+5. **疗效**：同输入 eps 正交噪声 1.33%→**0.61-0.71%**；step0 逐点最差
+   6.4→1.3 LSB；单张轨迹预览（seed100_0000）：**PSNR 34.15 dB**（v1.3 为
+   24.13 dB），std 34.9 vs F4 批次 33.4（坍缩消失）。
 
 ## 批次对照（同 seed=100 逐格可比）
 
@@ -62,9 +84,9 @@ seed=1000，t=980（50 档 step 0），全 51 表定点点：
 
 1. FiLM 表来自 fp32 时间通路（契约 §5.1，硬件无时间 MLP）；fake-quant 参考的
    时间 MLP 为 W8 量化。差异量级见逐层对齐报告。
-2. 注意力内部 uint8 概率 + int8 V 为契约设计（fake-quant 内部 float），
-   是注意力块及其下游差异的主导项（契约 §9.3）。
-3. 内部点 P99.95 标定允许 0.05% 离群截断（±128 饱和），fake-quant 内部不截断。
+2. 注意力内部 uint16 概率（v1.2）+ int8 V + int8 qkv 为契约设计
+   （fake-quant 内部 float）；v1.4 消融实测对残余噪声无显著贡献。
+3. 内部点 P99.95 标定 + margin=1.5 后残余削波可忽略（v1.4 实测）。
 
 ## 人工验收（签字后 M0 关闭）
 

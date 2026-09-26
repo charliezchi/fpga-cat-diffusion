@@ -1,5 +1,6 @@
 {
   "export_dir": "artifacts/f4/export-v3",
+  "fine_div": 1024,
   "tiers": {
     "50": {
       "act_scales": "act_scales_50.json",
@@ -40,6 +41,7 @@
     "seeds": [200, 201, 202, 203, 204, 205, 206, 207],
     "image_size": 256,
     "percentile": 99.95,
-    "subsample": 2048
+    "subsample": 2048,
+    "margin": 1.5
   }
 }

@@ -14,8 +14,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-QMAX = {8: 127, 16: 32767}
-QMIN = {8: -128, 16: -32768}
+QMAX = {8: 127, 16: 32767, 18: 131071, 19: 262143}
+QMIN = {8: -128, 16: -32768, 18: -131072, 19: -262144}
 
 # LUT 参数（configs/bittrue.json 的默认值，契约 §5.2/§5.3/§3）
 EXP_ENTRIES = 4096
@@ -78,22 +78,31 @@ def _mn(ratio: float) -> tuple[int, int]:
     return max(int(M), 1), int(N)
 
 
-def requant48(acc, M, N, bits: int = 16):
+def requant48(acc, M, N, bits: int = 16, out_shift: int = 0):
     """细格输入层的 requant：acc 可达 2^47（INT48 累加器，DSP 级联）。
 
     acc·M 会超 int64 → 拆 16 位精确计算（数学上与 (acc·M + 2^(N-1)) >> N
     逐位一致，测试钉死）：acc = hi·2^16 + lo，
     c = (lo·M + 2^(N-1)) >> 16，y = sat((hi·M + c) >> (N-16))。
+    out_shift > 0：输出细子格，y = sat((acc·M·2^out_shift + 2^(N-1)) >> N)
+    （residual 操作数细格域相加，契约 §4 v1.4）；A 预截到 2^62 防 int64
+    回绕（仅深饱和域，无实际语义影响）。
     """
     acc = np.asarray(acc, dtype=np.int64)
     M_arr = np.asarray(M, dtype=np.int64)
     hi = acc >> 16
     lo = acc - (hi << 16)
     A = hi * M_arr
-    B = lo * M_arr + (1 << (N - 1))
+    if out_shift:
+        B = ((lo * M_arr) << out_shift) + (1 << (N - 1))
+        lim = (1 << 62) >> out_shift
+        A = np.clip(A, -lim, lim - 1) << out_shift
+    else:
+        B = lo * M_arr + (1 << (N - 1))
     c = B >> 16
-    Q = N - 16
-    shifted = (A + c) >> Q
+    Q = np.asarray(N, dtype=np.int64) - 16
+    shifted = np.where(Q >= 0, (A + c) >> np.maximum(Q, 0),
+                       (A + c) << np.maximum(-Q, 0))
     return sat_int(shifted, bits)
 
 
@@ -200,7 +209,7 @@ def gen_silu_lut(s_in: float, s_out: float) -> np.ndarray:
     """SiLU 基表（契约 §5.2 v1.1）：257 项 INT32。
 
     T[a] = rh(silu((a-128)·s_coarse)/s_fine)，s_coarse = 输入点 INT8 基准格，
-    s_fine = 输出点细格（= s_coarse/256）。配合 silu_lut 的线性插值使用。
+    s_fine = 输出点细格（= s_coarse/fine_div）。配合 silu_lut 的线性插值使用。
     """
     a = np.arange(257, dtype=np.float64)
     z = (a - 128.0) * s_in
@@ -208,14 +217,15 @@ def gen_silu_lut(s_in: float, s_out: float) -> np.ndarray:
     return np.floor(silu / s_out + 0.5).astype(np.int64)  # INT32 域
 
 
-def silu_lut(table: np.ndarray, x_q) -> np.ndarray:
-    """查表 + 线性插值（契约 §5.2）：a = code>>8（算术），f = code-(a<<8)。"""
+def silu_lut(table: np.ndarray, x_q, sub_bits: int = 8) -> np.ndarray:
+    """查表 + 线性插值（契约 §5.2 v1.3）：a = code>>sub_bits（算术），
+    f = code-(a<<sub_bits)。sub_bits = log2(fine_div)（细格 256→8，1024→10）。"""
     x = np.asarray(x_q, dtype=np.int64)
-    a = x >> 8
-    f = x - (a << 8)
+    a = x >> sub_bits
+    f = x - (a << sub_bits)
     t0 = table[a + 128]
     t1 = table[a + 129]
-    return (t0 + ((t1 - t0) * f >> 8)).astype(np.int64)
+    return (t0 + ((t1 - t0) * f >> sub_bits)).astype(np.int64)
 
 
 def gen_exp_lut(entries: int = EXP_ENTRIES, log2_delta: float = EXP_LOG2_DELTA,
@@ -272,19 +282,21 @@ def rsqrt_q14(v_q16: int | np.ndarray, lut0: np.ndarray,
 def groupnorm_int(x_q: np.ndarray, num_groups: int, eps_q: int,
                   lut0: np.ndarray, lut1: np.ndarray,
                   Gc: np.ndarray, Nc: np.ndarray, Bq: np.ndarray,
-                  out_bits: int = 16, fine_input: bool = False) -> np.ndarray:
-    """GN 整数流（契约 §3 v1.1）。
+                  out_bits: int = 16, fine_input: bool = False,
+                  sub_bits: int = 8) -> np.ndarray:
+    """GN 整数流（契约 §3 v1.3）。
 
     x_q: codes (C,H,W)（表定点 INT8 网格或内部点细网格）；Gc/Nc/Bq 逐通道。
-    var/eps/inv 统一以 **INT8 等价格式** 计量（细格输入除以 256²），
-    保证 rsqrt Q14 输出精度与 int8 输入一致；x̂ 移位按输入网格分支
-    （fine_input: d6 为细格 Q6，x̂ = (d6·inv + 2^15) >> 16）。
-    out_bits：细网格输出 16，表定点输出 8。
+    var/eps/inv 统一以 **INT8 等价格式** 计量（细格输入除以 fine_div²，
+    fine_div = 2^sub_bits），保证 rsqrt Q14 输出精度与 int8 输入一致；
+    x̂ 移位按输入网格分支（fine_input: d6 为细格 Q(6+sub_bits)，
+    x̂ = (d6·inv + 2^(sub_bits+7)) >> (sub_bits+8)）。
+    out_bits：细网格输出 18（v1.3，int18 内部通路），表定点输出 8。
     """
     if x_q.ndim == 4:          # (N,C,H,W)：本项目 batch=1，兼容保留
         assert x_q.shape[0] == 1
         return groupnorm_int(x_q[0], num_groups, eps_q, lut0, lut1,
-                             Gc, Nc, Bq, out_bits, fine_input)[None]
+                             Gc, Nc, Bq, out_bits, fine_input, sub_bits)[None]
     C, H, W = x_q.shape
     G = num_groups
     ch_per_g = C // G
@@ -293,16 +305,17 @@ def groupnorm_int(x_q: np.ndarray, num_groups: int, eps_q: int,
     s1 = codes.sum(axis=(1, 2))                                   # INT64
     mu = (2 * s1 * (1 << 6) + n) // (2 * n)                       # Q0.6，自身格
     d = (codes << 6) - mu[:, None, None]                          # Q0.6，自身格
-    # var → INT8 等价格² Q16：细格输入除以 256²（即 >>16 再 <<4 → >>12）
+    # var → INT8 等价格² Q16：细格输入除以 fine_div²（>>(2·sub_bits) 再 <<4）
     var_q16 = (d * d).sum(axis=(1, 2)) // n
-    var_q16 = (var_q16 << 4) if not fine_input else (var_q16 >> 12)
+    var_q16 = (var_q16 << 4) if not fine_input else (
+        var_q16 >> (2 * sub_bits - 4))
     var_q16 = np.maximum(var_q16, 0) + eps_q
     inv = rsqrt_q14(var_q16, lut0, lut1)                          # Q14，int8 等价格
 
     if fine_input:
-        # (x-μ)_int8等价 = d6/2^14；x̂_q12 = d6·inv_q14 >> 16
-        xhat = np.clip((d * inv[:, None, None] + (1 << 15)) >> 16,
-                       -(1 << 15), (1 << 15) - 1)
+        # (x-μ)_int8等价 = d6/2^(6+sub_bits)；x̂_q12 = d6·inv_q14 >> (sub_bits+8)
+        xhat = np.clip((d * inv[:, None, None] + (1 << (sub_bits + 7)))
+                       >> (sub_bits + 8), -(1 << 15), (1 << 15) - 1)
     else:
         xhat = np.clip((d * inv[:, None, None] + (1 << 7)) >> 8,
                        -(1 << 15), (1 << 15) - 1)

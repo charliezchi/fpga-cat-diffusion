@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 # requant_params 层记录种类（契约 §7）
 KIND_CONV = 0   # conv/linear：逐通道 M/N
 KIND_GN = 1     # GN 输出 requant：逐通道带符号 Gc/Nc + Bq
-KIND_AV = 2     # 注意力 matmul 输出 requant：标量 M/N（ratio 含 1/256）
+KIND_AV = 2     # 注意力 matmul 输出 requant：标量 M/N（ratio 含 1/65536）
 
 # 点种类
 P_TABLED = 0    # v3 契约 51 处（act_scales_<steps>.json）
@@ -321,7 +321,8 @@ def build_graph(config: dict) -> Graph:
 
 
 def is_fine(g: Graph, point: str) -> bool:
-    """契约 §4 v1.1：内部点（除 qkv）为细网格（scale/256，INT16 存储）。"""
+    """契约 §4 v1.3：内部点（除 qkv）为细网格（scale/fine_div，fine_div=1024，
+    INT18 存储/内部数据通路）。"""
     return point in g.internal_points and not point.endswith(".qkv")
 
 

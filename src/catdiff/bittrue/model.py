@@ -15,7 +15,7 @@ import torch
 from catdiff.bittrue.graph import Graph, build_graph, is_fine
 from catdiff.bittrue.loader import BittrueTables, load_export
 from catdiff.bittrue.primitives import groupnorm_int, int_conv2d, \
-    int_linear, requant, sat_int, silu_lut, softmax_uint8
+    int_linear, requant, requant48, sat_int, silu_lut, softmax_uint8
 
 
 def _np(x: torch.Tensor) -> np.ndarray:
@@ -47,6 +47,9 @@ class BittrueUNet:
         self.lpb = cfg["layers_per_block"]
         self.n_down = len(cfg["down_block_types"])
         self.n_up = len(cfg["up_block_types"])
+        fd = int(tables.fine_div)
+        assert fd > 0 and fd & (fd - 1) == 0, f"fine_div 必须为 2 的幂: {fd}"
+        self.sub_bits = fd.bit_length() - 1
 
     # ---------------------------------------------------------------- 入口
     def forward(self, x_q16: torch.Tensor, step_idx: int,
@@ -92,7 +95,9 @@ class BittrueUNet:
         s_from = t.point_scale(src, ctx.g)
         s_to = t.point_scale(dst, ctx.g)
         M, N = _ident_mn(s_from, s_to)
-        bits = 16 if (wide or is_fine(self.g, dst)) else 8
+        # 细格目标 int18（内部通路，契约 §4 v1.3）；wide INT16（residual）；
+        # 其余 INT8
+        bits = 18 if is_fine(self.g, dst) else (16 if wide else 8)
         return requant(codes, M, N, bits=bits)
 
     def _conv_acc(self, name: str, x: np.ndarray, ctx: _StepCtx,
@@ -139,18 +144,61 @@ class BittrueUNet:
         y = self._linear_layer(name, x.reshape(c, h * w).T, ctx)  # (HW, O)
         return np.ascontiguousarray(y.T).reshape(y.shape[1], h, w)
 
+    # ---- residual 操作数细子格（契约 §4 v1.4）：requant48 out_shift → ----
+    # ---- 码格 s8/2^sub_bits，INT19 饱和（±255.99 int8 等效，支路抵消裕量） ----
+    def _conv_layer_fine(self, name: str, x: np.ndarray, ctx: _StepCtx,
+                         pad: int = 0, acc_bits: int = 48) -> np.ndarray:
+        lp = self.t.layers[name]
+        gi = ctx.g
+        acc = self._conv_acc(name, x, ctx, pad=pad, acc_bits=acc_bits)
+        out = np.empty_like(acc)
+        for c in range(acc.shape[0]):
+            out[c] = requant48(acc[c], int(lp.M[gi][c]), int(lp.N[gi][c]),
+                               19, out_shift=self.sub_bits)
+        return out
+
+    def _linear_layer_fine(self, name: str, x: np.ndarray, ctx: _StepCtx,
+                           acc_bits: int = 48) -> np.ndarray:
+        lp = self.t.layers[name]
+        gi = ctx.g
+        acc = _tc(x) @ _tc(lp.w.astype(np.int64)).T \
+            + torch.from_numpy(lp.b32[gi]).to(torch.float64)
+        lim = (1 << (acc_bits - 1)) - 1
+        acc64 = _np(torch.clamp(acc, -lim, lim))
+        out = np.empty_like(acc64)
+        for r_ in range(acc64.shape[0]):
+            out[r_] = requant48(acc64[r_], lp.M[gi], lp.N[gi], 19,
+                                out_shift=self.sub_bits)
+        return out
+
+    def _point_codes_fine(self, codes: np.ndarray, src: str, dst: str,
+                          ctx: _StepCtx) -> np.ndarray:
+        """恒等 requant 到 dst 点 int8 基准格的细子格（s8/2^sub_bits），INT19。"""
+        s_from = self.t.point_scale(src, ctx.g)
+        s_fine = self.t.point_scale(dst, ctx.g) / self.t.fine_div
+        M, N = _ident_mn(s_from, s_fine)
+        return requant(codes, M, N, bits=19)
+
+    def _collapse_int8(self, fine_sum: np.ndarray) -> np.ndarray:
+        """细子格和 → INT8：round-half-up 一次舍入（契约 §4 v1.4）。"""
+        return sat_int((fine_sum + (1 << (self.sub_bits - 1)))
+                       >> self.sub_bits, 8)
+
     def _gn(self, gn_name: str, codes: np.ndarray, ctx: _StepCtx) -> np.ndarray:
         p = self.t.gns[gn_name]
         gi = ctx.g
         lut0, lut1 = _rsqrt_luts()
         fine = is_fine(self.g, p.in_point)  # 输入为细网格（hidden/concat）
+        out_point = self.g.gn_layers[gn_name].out_point
+        out_bits = 18 if is_fine(self.g, out_point) else 8  # 细格输出 int18
         return groupnorm_int(codes, self.num_groups, p.eps_q[gi], lut0, lut1,
-                             p.Gc[gi], p.Nc[gi], p.Bq[gi], out_bits=16,
-                             fine_input=fine)
+                             p.Gc[gi], p.Nc[gi], p.Bq[gi], out_bits=out_bits,
+                             fine_input=fine, sub_bits=self.sub_bits)
 
     def _silu(self, in_point: str, out_point: str, codes: np.ndarray,
               ctx: _StepCtx) -> np.ndarray:
-        return silu_lut(ctx.silu[(in_point, out_point)], codes)
+        return silu_lut(ctx.silu[(in_point, out_point)], codes,
+                        sub_bits=self.sub_bits)
 
     # ---------------------------------------------------------------- 块
     def _conv_in(self, x_q16: np.ndarray, ctx: _StepCtx) -> np.ndarray:
@@ -179,19 +227,18 @@ class BittrueUNet:
         acc = acc + ctx.film[r][:, None, None]          # FiLM acc 域注入（§5.1）
         lp1 = self.t.layers[r + ".conv1"]
         hid = requant(acc, lp1.M[ctx.g], lp1.N[ctx.g],
-                      bits=16)  # 一次 requant → hidden 细格（契约 §4 v1.1）
+                      bits=18)  # 一次 requant → hidden 细格 int18（契约 §4 v1.3）
         n2 = self._gn(r + ".norm2", hid, ctx)
         h2 = self._silu(info.norm2, info.conv2_in, n2, ctx)
-        # residual 操作数 requant 到块出格、INT16 饱和，相加后截 INT8（§4）
-        main = self._conv_layer(r + ".conv2", h2, ctx, pad=1, out_bits=16,
-                                acc_bits=48)
+        # residual 操作数细子格 INT19（§4 v1.4），相加后一次舍入截 INT8
+        main = self._conv_layer_fine(r + ".conv2", h2, ctx, pad=1)
         sc_name = r + ".conv_shortcut"
         if sc_name in self.t.layers:
-            sc = self._conv_layer(sc_name, x_cat, ctx, out_bits=16)
+            sc = self._conv_layer_fine(sc_name, x_cat, ctx)
         else:
-            sc = self._point_codes(x_cat, info.block_in, info.block_out, ctx,
-                                   wide=True)
-        out = sat_int(sc + main, 8)
+            sc = self._point_codes_fine(x_cat, info.block_in, info.block_out,
+                                        ctx)
+        out = self._collapse_int8(sc + main)
         if trace is not None:
             trace[r] = out
         if trace_in is not None:
@@ -211,13 +258,12 @@ class BittrueUNet:
         av = requant(p.astype(np.int64) @ v,  # UINT8×INT8 → INT32，无偏置补偿
                      self.t.layers[a + ".av_requant"].M[ctx.g],
                      self.t.layers[a + ".av_requant"].N[ctx.g],
-                     bits=16)  # 1/256 已折入；av 细格（§4 v1.1）
-        o = self._linear_layer(a + ".to_out.0", av, ctx, out_bits=16,
-                                   acc_bits=48)
+                     bits=18)  # 1/65536 已折入；av 细格 int18（§4 v1.3）
+        o = self._linear_layer_fine(a + ".to_out.0", av, ctx)
         o_sp = np.ascontiguousarray(o.T).reshape(o.shape[1], h, w)
-        res = self._point_codes(x_in, info.block_in, info.block_out, ctx,
-                                wide=True)
-        out = sat_int(o_sp + res, 8)
+        res = self._point_codes_fine(x_in, info.block_in, info.block_out,
+                                     ctx)
+        out = self._collapse_int8(o_sp + res)
         if trace is not None:
             trace[a] = out
         if trace_in is not None:

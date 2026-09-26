@@ -4,7 +4,7 @@
 1. 内部激活量化点标定（契约 §4，协议同 F4 金标：顺序标定 8 seeds、
    每(点,步)子采样 2048、P99.95），并顺带记录 DDIM x 轨迹 max|x|（s_x 论证）；
 2. 全部 wired 层的 requant M/N（含 conv_in 的 x 边界、conv_out 的 s16 出点、
-   av_requant 的 1/256、GN 输出 requant 的 Gc/Nc/Bq）。
+   av_requant 的 1/65536、GN 输出 requant 的 Gc/Nc/Bq）。
 
 与 run_export.py 的用法对齐（每档一次）：
   uv run python src/catdiff/export/export_requant.py \
@@ -47,14 +47,14 @@ def _point_index(g) -> dict[str, int]:
 
 
 def _point_scale(point: str, tabled: dict, internal: dict, s_x: float,
-                 g_idx: int, g) -> float:
-    """点自身网格的 scale：内部点（除 qkv）为细网格 = 标定值/256（契约 §4 v1.1）。"""
+                 g_idx: int, g, fine_div: int = 256) -> float:
+    """点自身网格的 scale：内部点（除 qkv）细网格 = 标定值/fine_div（契约 §4 v1.3）。"""
     if point == _X_POINT:
         return s_x
     src = internal if point in g.internal_points else tabled
     v = src[point][g_idx]
     if is_fine(g, point):
-        return v / 256.0
+        return v / fine_div
     if point == "conv_out":  # eps INT16：同一物理量程重标到 INT16 网格（契约 §1.3）
         return v * 127.0 / 32767.0
     return v
@@ -79,14 +79,15 @@ def _write_norm_params(path: Path, gn_names: list[str], mods: dict) -> int:
 
 def _write_requant_params(path: Path, g, tabled: dict, internal: dict,
                           weights: dict, num_groups: int, s_x: float,
-                          gn_params: dict[str, tuple[np.ndarray, np.ndarray]]) -> int:
+                          gn_params: dict[str, tuple[np.ndarray, np.ndarray]],
+                          fine_div: int = 256) -> int:
     pidx = _point_index(g)
     layer_refs = g.all_layers()                      # KIND_CONV / KIND_AV
     gn_names = sorted(g.gn_layers)                   # KIND_GN
     n_layers = len(layer_refs) + len(gn_names)
     with open(path, "wb") as f:
         f.write(_MAGIC)
-        f.write(struct.pack("<IIII", 2, num_groups, n_layers,
+        f.write(struct.pack("<IIII", 3, num_groups, n_layers,
                             len(g.internal_points)))
         for name in g.internal_points:
             nb = name.encode()
@@ -108,8 +109,10 @@ def _write_requant_params(path: Path, g, tabled: dict, internal: dict,
                                 pidx[ref.in_point], out_kind,
                                 pidx[ref.out_point], c_count))
             for gi in range(num_groups):
-                s_in = _point_scale(ref.in_point, tabled, internal, s_x, gi, g)
-                s_out = _point_scale(ref.out_point, tabled, internal, s_x, gi, g)
+                s_in = _point_scale(ref.in_point, tabled, internal, s_x, gi, g,
+                                    fine_div)
+                s_out = _point_scale(ref.out_point, tabled, internal, s_x, gi,
+                                     g, fine_div)
                 f.write(struct.pack("<ff", s_in, s_out))
                 if ref.kind == KIND_AV:
                     M, N = scales_to_MN(s_in * ref.pre / s_out)
@@ -135,8 +138,10 @@ def _write_requant_params(path: Path, g, tabled: dict, internal: dict,
                                 pidx[ref.out_point], c_count))
             s_xhat = s_x  # x̂ 的 Q3.12 分辨率 = 2^-12（契约 §3）
             for gi in range(num_groups):
-                s_in = _point_scale(ref.in_point, tabled, internal, s_x, gi, g)
-                s_out = _point_scale(ref.out_point, tabled, internal, s_x, gi, g)
+                s_in = _point_scale(ref.in_point, tabled, internal, s_x, gi, g,
+                                    fine_div)
+                s_out = _point_scale(ref.out_point, tabled, internal, s_x, gi,
+                                     g, fine_div)
                 f.write(struct.pack("<ff", s_in, s_out))
                 Gc = np.empty(c_count, np.int32)
                 Nc = np.empty(c_count, np.uint8)
@@ -279,10 +284,19 @@ def main(argv: list[str] | None = None) -> int:
             "internal": internal,
         }, indent=1), encoding="utf-8")
 
+    # 内部点 scale 安全裕量（契约 §4 v1.4）：消内部点削波，缓存保持原始标定值
+    margin = float(bt["internal_calibration"].get("margin", 1.0))
+    if margin != 1.0:
+        internal = {k: ([v * margin for v in vs]
+                        if isinstance(vs, list) else vs)
+                    for k, vs in internal.items()}
+        print(f"内部点 scale 裕量 ×{margin}", flush=True)
+
     tabled = build_act_scales(tabled_raw)
     out = args.out_dir / f"requant_params_{args.table_suffix}.bin"
     n = _write_requant_params(out, g, tabled, internal, weights, n_groups,
-                              bt["s_x"], gn_params)
+                              bt["s_x"], gn_params,
+                              fine_div=int(bt.get("fine_div", 256)))
     print(f"{out.name}：{n} 条层记录、{len(g.internal_points)} 个内部点",
           flush=True)
     return 0
