@@ -27,9 +27,11 @@ golden/
 ## 步选择与体积取舍
 
 - 50 档：step 0 / 25 / 49；20 档：step 0 / 10 / 19（`configs/bittrue.json`）。
-- **50 档 step0 为全量转储**（51 个表定点全部 in/out）；其余步只存空间 ≤64×64
-  的点与 conv_in/conv_out——大张量（128ch×256²=8.4MB/张）只保留一份即可覆盖
-  RTL 各算子的位宽/卷积窗校验，重复步的全量转储只增加体积不增加算子覆盖。
+- **体积取舍**（实测约 520MB）：50 档 step0 保留空间 ≤64×64 的点 +
+  conv_in/conv_out；step25/49 只保留 ≤32×32；20 档仅 step0 逐层（双档切换由
+  e2e eps 的选中步与 ddim_coeffs_q.json 验证）。32² 以下已覆盖全部算子类型
+  （conv/GN/SiLU LUT/attention/residual/上下采样/INT16 边界），更大张量是
+  同算子的重复实例，只增体积不增覆盖。
 - `<点>.in` = 该量化点的输入 codes；`<点>.out` = 输出 codes（均为定点格上的
   整数，小端）。表定点名与 `act_scales_*.json` 一致；内部点命名见契约 §4。
 

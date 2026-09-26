@@ -44,14 +44,15 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _keep_point(name: str, shape, full: bool) -> bool:
-    """体积控制：step0 全存；其余步只存空间 ≤64×64 与首尾边界点。"""
-    if full or name in ("conv_in", "conv_out"):
+def _keep_point(name: str, shape, max_hw: int | None) -> bool:
+    """体积控制（README 写明取舍）：max_hw=None 全存；否则只存空间 ≤max_hw
+    的点与首尾边界点（conv_in/conv_out 覆盖 INT16 边界路径）。"""
+    if max_hw is None or name in ("conv_in", "conv_out"):
         return True
     hw = 1
     for d in shape[-2:]:
         hw *= int(d)
-    return hw <= 64 * 64
+    return hw <= max_hw
 
 
 @torch.no_grad()
@@ -116,8 +117,15 @@ def main(argv: list[str] | None = None) -> int:
               f"({time.time() - t_start:.0f}s)", flush=True)
 
         # ---- 逐层向量 ----
+        # 体积预算（约 520MB）：50 档 step0 留 ≤64²，其余步 ≤32²；
+        # 20 档只导 step0 逐层（双档切换由 e2e eps 的选中步验证）
         for step_idx in steps_sel:
-            full = (tier == "50" and step_idx == 0)
+            if tier == "50":
+                max_hw = 64 * 64 if step_idx == 0 else 32 * 32
+            elif step_idx == steps_sel[0]:
+                max_hw = 32 * 32
+            else:
+                continue
             sd = args.out_dir / f"layers/{tier}/step{step_idx:04d}"
             sd.mkdir(parents=True, exist_ok=True)
             trace, trace_in = {}, {}
@@ -129,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
             for point in g.tabled_points:
                 if point not in trace:
                     continue
-                if not _keep_point(point, trace[point].shape, full):
+                if not _keep_point(point, trace[point].shape, max_hw):
                     continue
                 _save_tensor(sd / f"{point}.in.bin", trace_in[point])
                 _save_tensor(sd / f"{point}.out.bin", trace[point])
@@ -141,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
             (sd / "shapes.json").write_text(json.dumps(shapes, indent=1),
                                             encoding="utf-8")
             print(f"[{tier}档] step{step_idx} 逐层向量 {len(shapes)} 点"
-                  f"（{'全量' if full else '裁剪'}）", flush=True)
+                  f"（max_hw={max_hw}）", flush=True)
 
         manifest["tiers"][tier] = {
             "golden_steps": steps_sel, "num_steps": n_steps,
