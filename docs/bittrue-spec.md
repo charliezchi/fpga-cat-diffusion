@@ -204,9 +204,11 @@ v   = requant(to_v(g))                        # → <attn>.qkv 点
 s_ij = Σ q_i·k_j                              # INT32
 a_ij = sat_u12( ((s_max - s_ij)·Kexp + 2^(Qe-1)) >> Qe )   # 行内减 max
 e_ij = exp_lut[a_ij]                          # 4096 项 UINT16，Q1.14
-p_ij = min(255, (e_ij·R + 2^23) >> 24)        # R = round_half_up(2^32 / Σ_j e_ij)
+p_ij = min(65535, (e_ij·R + 2^23) >> 24)      # R = round_half_up(2^40 / Σ_j e_ij)
+#   v1.1：概率改 UINT16（×256）；uint8 的 ±0.2% 概率量化噪声与内部 int8 同理
+#   经晚期步反馈造成幅度坍缩（§10）。硬件代价：p·v 乘积 24-bit。
 acc_i = Σ_j p_ij·v_j                          # UINT8×INT8 → INT32，**无偏置补偿**
-av  = requant16(acc_i, → <attn>.av 点细格, pre=1/256)  # 256 折进 ratio；INT16 饱和
+av  = requant16(acc_i, → <attn>.av 点细格, pre=1/65536)  # 65536 折进 ratio；INT16 饱和
 o   = requant16(to_out(av), → 表定 attention 出点)
 res = requant16(x_in, → 同点)
 out = sat_int8(o + res)
@@ -217,7 +219,7 @@ out = sat_int8(o + res)
   Qe = 32（Kexp ≤ 2^31 校验）。
 - softmax 全零行（减 max 后 arg 全 0）：Σe = N·2^14，R 正常，p = 256/N——
   无退化（测试钉死）。
-- UINT8×INT8 无偏移：无符号概率不含 +128 偏置，累加不需补偿项。
+- UINT16×INT8 无偏移：无符号概率不含偏置，累加不需补偿项（v1.1 前为 UINT8）。
 
 ### 5.4 residual add / concat / up/down sample
 
@@ -331,6 +333,9 @@ artifacts/f5/golden/
 
 ## 10. 版本历史
 
+- **v1.2**（2026-09-26）：softmax 概率改 **UINT16**（p = 65536·e/Σe，R = 2^40/Σe；
+  av 折算 pre=1/65536）。依据：v1.1 重采样后仍余幅度衰减（图像 std 20.8 vs
+  F4 33.4，PSNR 24.2 dB）——uint8 概率 ±0.2% 量化噪声成为首要余项。
 - **v1.1**（2026-09-26）：内部点细化 256×（INT16 细网格）：GN 输出/SiLU 输出/
   hidden/av/concat；SiLU 改 257 项基表 + 线性插值；GN 整数流改自身网格统一式
   （§3）；qkv 保持 INT8。依据：v1.0 实测——全 int8 内部点的量化噪声经 DDIM

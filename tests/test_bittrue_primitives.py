@@ -173,7 +173,7 @@ class TestSoftmax:
         Kexp, Qe = 1, 1  # acc_max - acc = 0 → a=0 恒成立（Qe≥1）
         p = softmax_uint8(scores, Kexp, Qe, lut)
         assert p.shape == scores.shape
-        assert p.min() >= 0 and p.max() <= 255
+        assert p.min() >= 0 and p.max() <= 65535
         assert np.allclose(p.sum(axis=1), 256 * np.ones(4), atol=0) or \
             p.max() == 256 // 8
 
@@ -181,7 +181,7 @@ class TestSoftmax:
         lut = gen_exp_lut()
         scores = np.array([[0, -10**6]], dtype=np.int64)
         p = softmax_uint8(scores, 1, 1, lut)
-        assert p[0, 0] == 255 and p[0, 1] == 0
+        assert p[0, 0] == 65535 and p[0, 1] == 0
 
     def test_uint8_unsigned_multiply_no_offset(self):
         """UINT8×INT8 无偏置补偿：全 v=127、均匀 p → out ≈ 127。"""
@@ -190,8 +190,8 @@ class TestSoftmax:
         p = softmax_uint8(scores, 1, 1, lut)
         v = np.full((1, 4), 127, dtype=np.int64)
         out_acc = (p.astype(np.int64) * v).sum()
-        # 均匀 p ≈ 64/256 → out_acc ≈ 4·64·127 = 32512；value = acc/256 ≈ 127
-        assert abs(out_acc / 256 - 127) <= 1
+        # 均匀 p ≈ 8192/65536 → out_acc ≈ 4·8192·127；value = acc/65536 ≈ 127
+        assert abs(out_acc / 65536 - 127) <= 1
 
 
 class TestGN:

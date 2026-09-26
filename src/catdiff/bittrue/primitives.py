@@ -319,8 +319,9 @@ def groupnorm_int(x_q: np.ndarray, num_groups: int, eps_q: int,
 
 def softmax_uint8(scores: np.ndarray, Kexp: int, Qe: int,
                   exp_lut: np.ndarray) -> np.ndarray:
-    """契约 §5.3：行内减 max → exp LUT（Δ=2^-8）→ 归一 → UINT8。
+    """契约 §5.3 v1.2：行内减 max → exp LUT（Δ=2^-8）→ 归一 → UINT16。
 
+    p = min(65535, (e·R + 2^23) >> 24)，R = rh(2^40/Σe)（p ≈ 65536·e/Σe）。
     scores: int64 (..., L)；Kexp/Qe 编码 s_qkv²·scale_attn·2^8。
     """
     s = scores.astype(np.int64)
@@ -329,9 +330,9 @@ def softmax_uint8(scores: np.ndarray, Kexp: int, Qe: int,
     a = np.clip(a, 0, EXP_ENTRIES - 1)
     e = exp_lut[a].astype(np.int64)
     total = e.sum(axis=-1, keepdims=True)
-    R = (2 * (1 << 32) + total) // (2 * total)          # rh(2^32/sum)，INT32
+    R = (2 * (1 << 40) + total) // (2 * total)          # rh(2^40/sum)
     p = (e * R + (1 << 23)) >> 24
-    return np.minimum(p, 255).astype(np.uint8)
+    return np.minimum(p, 65535).astype(np.uint16)
 
 
 # ---------------------------------------------------------------- DDIM

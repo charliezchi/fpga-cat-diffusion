@@ -257,7 +257,7 @@ def build_graph(config: dict) -> Graph:
                 g.layers[f"{a}.to_v"] = LayerRef(f"{a}.to_v", gn, qkv)
                 g.layers[f"{a}.to_out.0"] = LayerRef(f"{a}.to_out.0", av, a)
                 g.layers[f"{a}.av_requant"] = LayerRef(
-                    f"{a}.av_requant", qkv, av, kind=KIND_AV, pre=1.0 / 256.0)
+                    f"{a}.av_requant", qkv, av, kind=KIND_AV, pre=1.0 / 65536.0)
                 g.gn_layers[f"{a}.group_norm"] = GNRef(f"{a}.group_norm", nxt, gn)
                 g.observers += [(f"{a}.group_norm", "fwd", gn),
                                 (f"{a}.to_q", "fwd", qkv),
@@ -288,7 +288,7 @@ def build_graph(config: dict) -> Graph:
             g.layers[f"{a}.to_v"] = LayerRef(f"{a}.to_v", gn, qkv)
             g.layers[f"{a}.to_out.0"] = LayerRef(f"{a}.to_out.0", av, a)
             g.layers[f"{a}.av_requant"] = LayerRef(
-                f"{a}.av_requant", qkv, av, kind=KIND_AV, pre=1.0 / 256.0)
+                f"{a}.av_requant", qkv, av, kind=KIND_AV, pre=1.0 / 65536.0)
             g.gn_layers[f"{a}.group_norm"] = GNRef(f"{a}.group_norm", rin, gn)
             g.observers += [(f"{a}.group_norm", "fwd", gn),
                             (f"{a}.to_q", "fwd", qkv),
@@ -304,7 +304,7 @@ def build_graph(config: dict) -> Graph:
     g.layers[f"{a}.to_v"] = LayerRef(f"{a}.to_v", gn, qkv)
     g.layers[f"{a}.to_out.0"] = LayerRef(f"{a}.to_out.0", av, a)
     g.layers[f"{a}.av_requant"] = LayerRef(
-        f"{a}.av_requant", qkv, av, kind=KIND_AV, pre=1.0 / 256.0)
+        f"{a}.av_requant", qkv, av, kind=KIND_AV, pre=1.0 / 65536.0)
     g.gn_layers[f"{a}.group_norm"] = GNRef(f"{a}.group_norm", "mid_block.resnets.0", gn)
     g.observers += [(f"{a}.group_norm", "fwd", gn), (f"{a}.to_q", "fwd", qkv),
                     (f"{a}.to_out.0", "pre", av)]
