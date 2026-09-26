@@ -18,7 +18,7 @@ import numpy as np
 
 from catdiff.bittrue.cdw2 import WeightRecord, read_weights_bin
 from catdiff.bittrue.graph import KIND_AV, KIND_CONV, KIND_GN, P_X, \
-    build_graph, silu_lut_specs
+    build_graph, is_fine, silu_lut_specs
 from catdiff.bittrue.primitives import EXP_LOG2_DELTA, S_X, scales_to_MN
 
 @dataclass
@@ -37,6 +37,7 @@ class LayerParams:
 @dataclass
 class GNParams:
     name: str
+    in_point: str
     s_in: list[float]
     s_out: list[float]
     Gc: list[np.ndarray]
@@ -66,15 +67,25 @@ class BittrueTables:
     attn_scale: float = 1.0
     x_clip_grid: int = 4096
     film_timesteps: list[int] = field(default_factory=list)
+    _g: object = None
 
     def point_scale(self, point: str, g: int) -> float:
+        """点自身网格 scale：内部点（除 qkv）为细网格 = 标定值/256（契约 §4）。"""
         src = (self.internal_scales if point in self.internal_scales
                else self.tabled_scales)
-        return src[point][g]
+        v = src[point][g]
+        return v / 256.0 if is_fine(self._g, point) else v
 
     def group(self, step_idx: int, num_steps: int) -> int:
         per = num_steps // self.num_groups
         return min(step_idx // per, self.num_groups - 1)
+
+
+def _point_scale(point: str, tabled: dict, internal: dict, g_idx: int, g) -> float:
+    """点自身网格 scale：内部点（除 qkv）细网格 = 标定值/256（契约 §4 v1.1）。"""
+    src = internal if point in internal else tabled
+    v = src[point][g_idx]
+    return v / 256.0 if is_fine(g, point) else v
 
 
 def _read_requant_params(path: Path):
@@ -84,7 +95,7 @@ def _read_requant_params(path: Path):
         raise ValueError(f"requant_params magic 错误: {data[:4]!r}")
     version, num_groups, num_layers, num_internal = struct.unpack_from(
         "<IIII", data, 4)
-    assert version == 1, version
+    assert version == 2, version
     off = 20
     internal: dict[str, list[float]] = {}
     for _ in range(num_internal):
@@ -242,8 +253,12 @@ def load_export(export_dir: str | Path, tier: str,
             Gc_l.append(Gc.astype(np.int64))
             Nc_l.append(Nc)
             Bq_l.append(Bq.astype(np.int64))
-            eps_l.append(int(round(1e-6 / (s_in * s_in) * (1 << 16))))
-        gns[name] = GNParams(name, s_in_l, s_out_l, Gc_l, Nc_l, Bq_l, eps_l)
+            # eps/var 统一 INT8 等价格（契约 §3 v1.1）：细格输入 s_in 为细格值，
+            # 粗格 = s_in·256
+            s_in_int8 = s_in * 256.0 if is_fine(g, ref.in_point) else s_in
+            eps_l.append(int(round(1e-6 / (s_in_int8 * s_in_int8) * (1 << 16))))
+        gns[name] = GNParams(name, ref.in_point, s_in_l, s_out_l,
+                             Gc_l, Nc_l, Bq_l, eps_l)
 
     # FiLM 表（fp32 → conv1 acc 域 int64；各 resnet 的 C 不同，变长解析）
     fidx = json.loads((d / files["film_index"]).read_text(encoding="utf-8"))
@@ -261,8 +276,7 @@ def load_export(export_dir: str | Path, tier: str,
         per_step = np.empty((film_steps, c0), np.int64)
         for si in range(film_steps):
             gi = min(si // (len(steps) // num_groups), num_groups - 1)
-            s_in = (internal[silu1_point][gi]
-                    if silu1_point in internal else tabled_scales[silu1_point][gi])
+            s_in = _point_scale(silu1_point, tabled_scales, internal, gi, g)
             vec = per_resnet[ri][si]
             per_step[si] = [
                 math.floor(float(v) / (s_in * float(sw)) + 0.5)
@@ -288,7 +302,7 @@ def load_export(export_dir: str | Path, tier: str,
     silu_luts = {}
     for in_p, out_p in silu_lut_specs(g):
         silu_luts[(in_p, out_p)] = [
-            _gen_silu_lut_i(in_p, out_p, gi, internal, tabled_scales)
+            _gen_silu_lut_i(in_p, out_p, gi, internal, tabled_scales, g)
             for gi in range(num_groups)]
 
     # 注意力 exp 地址缩放
@@ -312,13 +326,12 @@ def load_export(export_dir: str | Path, tier: str,
         ddim_A=A_l, ddim_B=B_l, ddim_C=C_l, ddim_D=D_l,
         silu_luts=silu_luts, attn_Kexp=Kexp, attn_Qe=32,
         attn_scale=attn_scale, x_clip_grid=bt_config["x_clip_grid"],
-        film_timesteps=steps)
+        film_timesteps=steps, _g=g)
 
 
-def _gen_silu_lut_i(in_point, out_point, gi, internal, tabled):
+def _gen_silu_lut_i(in_point, out_point, gi, internal, tabled, g):
     from catdiff.bittrue.primitives import gen_silu_lut
-    s_in = (internal[in_point][gi] if in_point in internal
-            else tabled[in_point][gi])
-    s_out = (internal[out_point][gi] if out_point in internal
-             else tabled[out_point][gi])
-    return gen_silu_lut(s_in, s_out)
+    s_fine = _point_scale(out_point, tabled, internal, gi, g)
+    # 输入恒为 GN 输出（细网格点）：粗地址格 = 细格 ×256（契约 §5.2 v1.1）
+    s_coarse = _point_scale(in_point, tabled, internal, gi, g) * 256.0
+    return gen_silu_lut(s_coarse, s_fine)

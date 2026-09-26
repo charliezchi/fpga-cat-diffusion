@@ -27,7 +27,7 @@ import torch
 
 from catdiff.bittrue.cdw2 import read_weights_bin
 from catdiff.bittrue.graph import KIND_AV, KIND_CONV, KIND_GN, P_INTERNAL, \
-    P_TABLED, P_X, build_graph
+    P_TABLED, P_X, build_graph, is_fine
 from catdiff.bittrue.primitives import scales_to_MN
 from catdiff.export.run_export import build_act_scales
 from catdiff.model.ddim import DDIMScheduler
@@ -46,20 +46,18 @@ def _point_index(g) -> dict[str, int]:
     return {name: i for i, name in enumerate(order)}
 
 
-def _in_scale(point: str, tabled: dict, internal: dict, s_x: float,
-              g_idx: int, g) -> float:
+def _point_scale(point: str, tabled: dict, internal: dict, s_x: float,
+                 g_idx: int, g) -> float:
+    """点自身网格的 scale：内部点（除 qkv）为细网格 = 标定值/256（契约 §4 v1.1）。"""
     if point == _X_POINT:
         return s_x
     src = internal if point in g.internal_points else tabled
-    return src[point][g_idx]
-
-
-def _out_scale(point: str, tabled: dict, internal: dict, g_idx: int, g) -> float:
-    src = internal if point in g.internal_points else tabled
-    s8 = src[point][g_idx]
+    v = src[point][g_idx]
+    if is_fine(g, point):
+        return v / 256.0
     if point == "conv_out":  # eps INT16：同一物理量程重标到 INT16 网格（契约 §1.3）
-        return s8 * 127.0 / 32767.0
-    return s8
+        return v * 127.0 / 32767.0
+    return v
 
 
 def _write_norm_params(path: Path, gn_names: list[str], mods: dict) -> int:
@@ -88,7 +86,7 @@ def _write_requant_params(path: Path, g, tabled: dict, internal: dict,
     n_layers = len(layer_refs) + len(gn_names)
     with open(path, "wb") as f:
         f.write(_MAGIC)
-        f.write(struct.pack("<IIII", 1, num_groups, n_layers,
+        f.write(struct.pack("<IIII", 2, num_groups, n_layers,
                             len(g.internal_points)))
         for name in g.internal_points:
             nb = name.encode()
@@ -110,8 +108,8 @@ def _write_requant_params(path: Path, g, tabled: dict, internal: dict,
                                 pidx[ref.in_point], out_kind,
                                 pidx[ref.out_point], c_count))
             for gi in range(num_groups):
-                s_in = _in_scale(ref.in_point, tabled, internal, s_x, gi, g)
-                s_out = _out_scale(ref.out_point, tabled, internal, gi, g)
+                s_in = _point_scale(ref.in_point, tabled, internal, s_x, gi, g)
+                s_out = _point_scale(ref.out_point, tabled, internal, s_x, gi, g)
                 f.write(struct.pack("<ff", s_in, s_out))
                 if ref.kind == KIND_AV:
                     M, N = scales_to_MN(s_in * ref.pre / s_out)
@@ -137,8 +135,8 @@ def _write_requant_params(path: Path, g, tabled: dict, internal: dict,
                                 pidx[ref.out_point], c_count))
             s_xhat = s_x  # x̂ 的 Q3.12 分辨率 = 2^-12（契约 §3）
             for gi in range(num_groups):
-                s_in = _in_scale(ref.in_point, tabled, internal, s_x, gi, g)
-                s_out = _out_scale(ref.out_point, tabled, internal, gi, g)
+                s_in = _point_scale(ref.in_point, tabled, internal, s_x, gi, g)
+                s_out = _point_scale(ref.out_point, tabled, internal, s_x, gi, g)
                 f.write(struct.pack("<ff", s_in, s_out))
                 Gc = np.empty(c_count, np.int32)
                 Nc = np.empty(c_count, np.uint8)
@@ -202,7 +200,9 @@ def _calibrate_internal(config: dict, unet_cfg: dict, tabled_raw: dict, g,
                                "int16_act_layers", ())))
     apply_fake_quant(model, ctx)
 
-    handles = register_observers(model, g, per_step := {}, [0], subsample)
+    per_step: dict = {}
+    step_box = [0]
+    handles = register_observers(model, g, per_step, step_box, subsample)
 
     x_max = 0.0
     for seed in seeds:

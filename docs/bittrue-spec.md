@@ -30,7 +30,8 @@
 
 | 对象 | 格式 | scale 来源 |
 |---|---|---|
-| 内部激活（50 个表定点 + 内部点） | INT8 对称 per-tensor，[-128,127] | act_scales 表（表定点）/ requant_params（内部点） |
+| 表定点激活（51 处，v3 契约） | INT8 对称 per-tensor，[-128,127] | act_scales 表 |
+| 内部点激活（§4：GN 输出/SiLU 输出/hidden/av） | **INT16 细网格**，scale = 内部标定值/256（即 256× 细于 INT8 基准格），[-32512,32767] | requant_params（内部点） |
 | x（DDIM 状态，conv_in 输入） | INT16，**s_x = 2^-12 定死**（Q3.12，±8） | 契约常量 |
 | eps（conv_out 输出激活） | INT16 对称 per-tensor | s16 = act_scales['conv_out'][g] × 127/32767 |
 | 权重（内部 152 层） | INT8 per-channel | weights.bin |
@@ -80,21 +81,28 @@ y_q[i] = sat_int(bits)( (acc[i]·M[i] + 2^(N[i]-1)) >> N[i] )
 
 ## 3. GroupNorm 整数流（71 处：32 resnet×2 + 6 attention + conv_norm_out）
 
-输入：INT8 codes @ s_in（本 GN 的输入点 scale），32 通道组，每组 G 通道 × H×W。
+输入：codes @ s_own（本 GN 输入点自身网格的 scale：表定点输入为 INT8 网格，
+细网格输入为 §4 的 INT16 网格），32 通道组，每组 G 通道 × H×W。
+（v1.1 修订：内部点细化后 GN 统一按"自身网格"流，对 INT8 输入与 v1.0 行为一致。）
+
+var/eps/inv 统一以 **INT8 等价格式** 计量（细格输入：除以 256²；这保证
+rsqrt Q14 输出对两种输入网格都有 ≥9 位有效位），x̂ 移位按输入网格分支：
 
 ```
-S1   = Σ codes                          # INT32（≤127×262144 = 3.3e7）
-S2   = Σ codes²                         # INT64（≤4.2e9，RTL 用 64-bit 累加）
+S1   = Σ codes                          # INT64（细网格最大 32512×262144 = 8.5e9）
 N    = G·H·W
-μ_q  = round_half_up(S1·2^8 / N)        # Q8.8，输入格
-d    = (code << 8) - μ_q                # Q8.8
-var_q16 = (S2 << 16)//N - μ_q²          # Q16，输入格²；负则截 0
-var_q16 += eps_q                        # eps_q = round(1e-6 / s_in² · 2^16)
-inv_q14 = rsqrt_lut(var_q16)            # §3.1
-x̂_q    = sat_int16( (d·inv_q14 + 2^9) >> 10 )     # Q3.12（s_xhat = 2^-12，±8）
-# 逐通道输出 requant（γ 带符号折进 M，β 加在输出格）：
+μ_q  = round_half_up(S1·2^6 / N)        # Q0.6，自身格
+d    = (code << 6) - μ_q                # Q0.6，自身格
+var_q16 = (Σ d² // N) << 4              # 表定点输入（INT8 等格 = 自身格）
+var_q16 = (Σ d² // N) >> 12             # 细格输入（÷256²）
+var_q16 += eps_q                        # eps_q = round(1e-6 / s_in_int8等价² · 2^16)
+inv_q14 = rsqrt_lut(var_q16)            # §3.1，int8 等格单位
+x̂_q    = sat_int16((d·inv_q14 + 2^7) >> 8)        # 表定点输入
+x̂_q    = sat_int16((d·inv_q14 + 2^15) >> 16)      # 细格输入
+#   （Q3.12 = s_xhat 2^-12，±8；两式的物理值一致：细格 d6 大 2^8、inv 同、移位多 2^8）
+# 逐通道输出 requant（γ 带符号折进 M，β 加在输出格；输出为细网格 INT16）：
 t     = (x̂_q·Gc[c] + 2^(Nc[c]-1)) >> Nc[c]        # INT64 乘积
-y     = sat_int8(t + Bq[c])
+y     = sat_int16(t + Bq[c])
 ```
 - `Gc[c] = round_half_up(s_xhat·γ[c]/s_out · 2^Nc[c])`（**有符号** INT32，
   Nc 规格化同 §2.2 但按 |ratio|）；`Bq[c] = round_half_up(β[c]/s_out)`（INT32，
@@ -111,15 +119,25 @@ y     = sat_int8(t + Bq[c])
      `LUT0[k] = round_half_up(2^25 / √((k+2048)·2^11))`，
      `LUT1[k] = round_half_up(2^25·√2 / √((k+2048)·2^11))`（各 2048 项 UINT32，
      合并寻址 (E&1, j) 亦可）。
-  5. 可选 1 次牛顿迭代（Task 3 关口数据决定是否启用，默认不启用；
-     若启用公式：`x1 = (x0·(3·2^30 - (v·x0²)>>q) / 2` 定点式由 Task 3 定稿回写本节）。
-- 误差预算（Task 3 关口）：GN 输出误差 ≤1 LSB 占比 ≥99.9% 且无 >4 LSB；
-  不达标则降级"rsqrt 用 fp32 IP（IEEE754，位真模拟以 float32 模拟该单点）"。
+  5. 牛顿迭代：**不启用**（Task 3 实测定稿，见下）。
+- 误差预算（Task 3 关口实测，2026-09-26 定稿）：2048×2 项 LUT + 0 次 Newton，
+  fake-quant 轨迹 2 seeds × 5 步 × 全部 71 GN = 16.59 亿元素：
+  **≤1 LSB 占比 100.0000%**（判据 ≥99.9%）；>4 LSB 仅 20 个元素
+  （1.2e-8，孤立离群，集中末端大尺寸 GN）。判据达标，**维持纯 LUT 方案，
+  不启用 fp32 IP 降级**。var 动态范围实测 [1.42, 6013]（x 格²，逐组），
+  均在 LUT 表示域内。
 
 ## 4. 内部激活量化点（新增，scale 由扩导出器标定下发）
 
-v3 的 51 处表定点只覆盖模块边界；层内整数化的 conv/GN/SiLU/注意力中间值需要
-自己的量化点。命名与清单（per 步组 10 组，与表定点同协议标定）：
+v1.1 修订：内部点的**存储网格 = 标定值（INT8 基准）/256**（INT16 细网格，
+[-32512,32767]）。依据：全 int8 内部点的量化噪声（每 resnet 约 6 个 0.8% 级
+量化器）经 DDIM 晚期步反馈把轨迹幅度拉向均值（实测图像系统性变淡、
+PSNR 19.0 dB < 30 dB 门槛）；内部点细化 256× 后该噪声源消除，51 处表定点
+（v3 契约 §1.3，fake-quant 同样量化）不受影响。细网格点：全部 GN 输出、
+SiLU 输出、hidden、av、concat；**qkv 保持 INT8**（QK^T 的 int8×int8 DSP 语义）。
+表定点清单不变：
+
+命名与清单（per 步组 10 组，与表定点同协议标定；存储 scale = 标定值/256）：
 
 | 内部点 | 物理含义 | 消费者 |
 |---|---|---|
@@ -140,6 +158,7 @@ INT8**：块出点 scale 按 |和| 标定，支路本身可超 ±127（相互抵
 无权重支路的恒等 requant（residual 的 x 支路、concat
 两输入、mid_block 容器双定点）的 M/N = scales_to_MN(s_from/s_to)，由导出包
 scale 确定性推导（与 M/N 下发表同一公式，测试钉死），不再单独下发。
+输出为细网格的 requant 饱和域为 INT16（±32767）；输出为表定点的保持 INT8。
 
 ## 5. 各算子整数流
 
@@ -148,7 +167,7 @@ scale 确定性推导（与 M/N 下发表同一公式，测试钉死），不再
 ```
 h1  = silu_lut1( gn( x_in, norm1 ) )          # x_in: 表定点或 concat 点
 acc = conv1(h1) + film_q32 + b32              # film: §0/§7，acc 域累加器初值
-hid = requant(acc, → hidden 点)
+hid = requant16(acc, → hidden 点细格)         # INT16 饱和（§4 细网格）
 h2  = silu_lut2( gn( hid, norm2 ) )
 main= requant16(conv2(h2), → 表定块出点)       # INT16 饱和（§4 规则）
 sc  = (有 conv_shortcut) requant16(conv_shortcut(x_in), → 同点)
@@ -161,11 +180,20 @@ time_embedding MLP 与 time_emb_proj（运行时不消费这两组权重；注�
 film 表来自 fp32 时间通路，与 fake-quant 的 W8 时间 MLP 有 <1 LSB 级系统差，
 Task 4 报告记录）。
 
-### 5.2 SiLU LUT
+### 5.2 SiLU LUT + 线性插值（v1.1：输出细网格）
 
-256 项 INT8，`table[a] = sat_int8(round_half_up(silu((a-128)·s_in)/s_out))`，
-a∈[0,255] 地址 = 输入 code+128。每（LUT 输入点, 输出点, 步组）一张，
-由 PC 生成（`gen_silu_lut`）并随黄金向量归档（§7）。silu(0)=0 → a=128 项为 0。
+257 项 INT32 基表：`T[a] = round_half_up(silu((a-128)·s_coarse)/s_fine)`，
+a∈[0,256]，s_coarse = 输入点 INT8 基准格，s_fine = 输出点细格（= s_coarse/256，
+T 值域 ±32512）。输入为细网格 INT16 code：粗地址 `a = code >> 8`（算术右移，
+[-128,127]），小数 `f = code - (a<<8) ∈ [0,255]`：
+
+```
+y = T[a+128] + ((T[a+129] - T[a+128])·f >> 8)    # sat_int16
+```
+
+（v1.0 的纯 256 项 INT8 直查表是本节的 f=0 特例；插值误差 ≪1 细格 LSB，
+硬件代价 = 1 个乘法器。每（LUT 输入点, 输出点, 步组）一张，PC 生成
+（`gen_silu_lut`）并随黄金向量归档。silu(0)=0 → a=128、f=0 项为 0。）
 
 ### 5.3 Attention（单头 d=512，scale = 512^-0.5）
 
@@ -178,7 +206,7 @@ a_ij = sat_u12( ((s_max - s_ij)·Kexp + 2^(Qe-1)) >> Qe )   # 行内减 max
 e_ij = exp_lut[a_ij]                          # 4096 项 UINT16，Q1.14
 p_ij = min(255, (e_ij·R + 2^23) >> 24)        # R = round_half_up(2^32 / Σ_j e_ij)
 acc_i = Σ_j p_ij·v_j                          # UINT8×INT8 → INT32，**无偏置补偿**
-av  = requant(acc_i, → <attn>.av 点, pre=1/256)  # 256 折进 ratio（§2.2）
+av  = requant16(acc_i, → <attn>.av 点细格, pre=1/256)  # 256 折进 ratio；INT16 饱和
 o   = requant16(to_out(av), → 表定 attention 出点)
 res = requant16(x_in, → 同点)
 out = sat_int8(o + res)
@@ -204,8 +232,8 @@ out = sat_int8(o + res)
 
 - conv_in：x INT16 @ s_x × W INT16 → INT32（18×18 DSP 语义）→ requant INT8
   到 `conv_in` 表定点。
-- conv_out：INT8 × W INT16 → INT32 → requant **INT16** 到 eps（s16，§1），
-  直接出给 DDIM 更新单元。
+- conv_out：细网格 INT8 基准输入（conv_norm_out.silu 点，INT16 存储）× W INT16
+  → INT32 → requant **INT16** 到 eps（s16，§1），直接出给 DDIM 更新单元。
 
 ## 6. DDIM 更新单元（eta=0，clip_sample=true）
 
@@ -300,3 +328,12 @@ artifacts/f5/golden/
    （int16 域 LSB = s8/258，作浮点级参考同时报告）；
 4. Task 5 机器标准：位真批次 vs F4 签字批次逐张 PSNR ≥ 30 dB，
    并附 vs fp32 基准对照表；人工签字由项目负责人完成（报告验收区留空）。
+
+## 10. 版本历史
+
+- **v1.1**（2026-09-26）：内部点细化 256×（INT16 细网格）：GN 输出/SiLU 输出/
+  hidden/av/concat；SiLU 改 257 项基表 + 线性插值；GN 整数流改自身网格统一式
+  （§3）；qkv 保持 INT8。依据：v1.0 实测——全 int8 内部点的量化噪声经 DDIM
+  晚期反馈使轨迹幅度坍缩（图像系统性变淡，vs F4 批次 PSNR 19.0 dB），单步
+  对齐与 GN 误差预算均达标，问题为设计噪声地板而非实现缺陷。
+- v1.0（2026-09-25）：初版。

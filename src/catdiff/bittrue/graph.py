@@ -320,6 +320,11 @@ def build_graph(config: dict) -> Graph:
     return g
 
 
+def is_fine(g: Graph, point: str) -> bool:
+    """契约 §4 v1.1：内部点（除 qkv）为细网格（scale/256，INT16 存储）。"""
+    return point in g.internal_points and not point.endswith(".qkv")
+
+
 def silu_lut_specs(g: Graph) -> list[tuple[str, str]]:
     """(输入点, 输出点) 对：全部 SiLU LUT 的生成清单（契约 §5.2）。"""
     specs = set()

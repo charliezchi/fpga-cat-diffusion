@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from catdiff.bittrue.graph import Graph, build_graph
+from catdiff.bittrue.graph import Graph, build_graph, is_fine
 from catdiff.bittrue.loader import BittrueTables, load_export
 from catdiff.bittrue.primitives import groupnorm_int, int_conv2d, \
     int_linear, requant, sat_int, silu_lut, softmax_uint8
@@ -92,11 +92,13 @@ class BittrueUNet:
         s_from = t.point_scale(src, ctx.g)
         s_to = t.point_scale(dst, ctx.g)
         M, N = _ident_mn(s_from, s_to)
-        return requant(codes, M, N, bits=16 if wide else 8)
+        bits = 16 if (wide or is_fine(self.g, dst)) else 8
+        return requant(codes, M, N, bits=bits)
 
     def _conv_acc(self, name: str, x: np.ndarray, ctx: _StepCtx,
-                  stride: int = 1, pad: int | tuple = 0) -> np.ndarray:
-        """原始累加器（INT32 语义，含 b32），不 requant（FiLM 注入域，契约 §2.1）。"""
+                  stride: int = 1, pad: int | tuple = 0,
+                  acc_bits: int = 32) -> np.ndarray:
+        """原始累加器（含 b32），不 requant（FiLM 注入域，契约 §2.1）。"""
         import torch.nn.functional as F
         from catdiff.bittrue.primitives import _pad_tuple
         lp = self.t.layers[name]
@@ -104,28 +106,30 @@ class BittrueUNet:
         if pad:
             xf = F.pad(xf, _pad_tuple(pad))
         acc = F.conv2d(xf, _tc(lp.w.astype(np.int64)), stride=stride)             + torch.from_numpy(lp.b32[ctx.g]).to(torch.float64).view(1, -1, 1, 1)
-        from catdiff.bittrue.primitives import _sat32
-        return _np(_sat32(acc))[0]
+        lim = (1 << (acc_bits - 1)) - 1
+        return _np(torch.clamp(acc, -lim, lim))[0]
 
     def _conv_layer(self, name: str, x: np.ndarray, ctx: _StepCtx,
                     stride: int = 1, pad: int | tuple = 0,
-                    out_bits: int = 8) -> np.ndarray:
+                    out_bits: int = 8, acc_bits: int = 32) -> np.ndarray:
         """(C,H,W) codes → (C',H',W') codes（batch=1，位真模型内去 batch 维）。"""
         lp = self.t.layers[name]
         gi = ctx.g
         y = int_conv2d(_tc(x[None]), _tc(lp.w.astype(np.int64)),
                        lp.M[gi].tolist(), lp.N[gi].tolist(),
                        bias32=torch.from_numpy(lp.b32[gi]),
-                       stride=stride, pad=pad, out_bits=out_bits)
+                       stride=stride, pad=pad, out_bits=out_bits,
+                       acc_bits=acc_bits)
         return _np(y)[0]
 
     def _linear_layer(self, name: str, x: np.ndarray, ctx: _StepCtx,
-                      out_bits: int = 8) -> np.ndarray:
+                      out_bits: int = 8, acc_bits: int = 32) -> np.ndarray:
         lp = self.t.layers[name]
         gi = ctx.g
         y = int_linear(_tc(x), _tc(lp.w.astype(np.int64)),
                        lp.M[gi].tolist(), lp.N[gi].tolist(),
-                       bias32=torch.from_numpy(lp.b32[gi]), out_bits=out_bits)
+                       bias32=torch.from_numpy(lp.b32[gi]), out_bits=out_bits,
+                       acc_bits=acc_bits)
         return _np(y)
 
     def _linear_spatial(self, name: str, x: np.ndarray,
@@ -139,8 +143,10 @@ class BittrueUNet:
         p = self.t.gns[gn_name]
         gi = ctx.g
         lut0, lut1 = _rsqrt_luts()
+        fine = is_fine(self.g, p.in_point)  # 输入为细网格（hidden/concat）
         return groupnorm_int(codes, self.num_groups, p.eps_q[gi], lut0, lut1,
-                             p.Gc[gi], p.Nc[gi], p.Bq[gi])
+                             p.Gc[gi], p.Nc[gi], p.Bq[gi], out_bits=16,
+                             fine_input=fine)
 
     def _silu(self, in_point: str, out_point: str, codes: np.ndarray,
               ctx: _StepCtx) -> np.ndarray:
@@ -151,7 +157,8 @@ class BittrueUNet:
         return self._conv_layer("conv_in", x_q16, ctx, pad=1)  # INT16×INT16 → INT8
 
     def _conv_out(self, x: np.ndarray, ctx: _StepCtx) -> np.ndarray:
-        return self._conv_layer("conv_out", x, ctx, pad=1, out_bits=16)
+        return self._conv_layer("conv_out", x, ctx, pad=1, out_bits=16,
+                                acc_bits=48)
 
     def _resnet(self, r: str, x_in: np.ndarray, skip: np.ndarray | None,
                 ctx: _StepCtx, trace: dict | None,
@@ -168,14 +175,16 @@ class BittrueUNet:
             x_cat = x_in
         n1 = self._gn(r + ".norm1", x_cat, ctx)
         h1 = self._silu(info.norm1, info.conv1_in, n1, ctx)
-        acc = self._conv_acc(r + ".conv1", h1, ctx, pad=1)  # 原始 acc，含 b32
+        acc = self._conv_acc(r + ".conv1", h1, ctx, pad=1, acc_bits=48)
         acc = acc + ctx.film[r][:, None, None]          # FiLM acc 域注入（§5.1）
         lp1 = self.t.layers[r + ".conv1"]
-        hid = requant(acc, lp1.M[ctx.g], lp1.N[ctx.g])  # 一次 requant → hidden 点
+        hid = requant(acc, lp1.M[ctx.g], lp1.N[ctx.g],
+                      bits=16)  # 一次 requant → hidden 细格（契约 §4 v1.1）
         n2 = self._gn(r + ".norm2", hid, ctx)
         h2 = self._silu(info.norm2, info.conv2_in, n2, ctx)
         # residual 操作数 requant 到块出格、INT16 饱和，相加后截 INT8（§4）
-        main = self._conv_layer(r + ".conv2", h2, ctx, pad=1, out_bits=16)
+        main = self._conv_layer(r + ".conv2", h2, ctx, pad=1, out_bits=16,
+                                acc_bits=48)
         sc_name = r + ".conv_shortcut"
         if sc_name in self.t.layers:
             sc = self._conv_layer(sc_name, x_cat, ctx, out_bits=16)
@@ -201,8 +210,10 @@ class BittrueUNet:
         p = softmax_uint8(scores, ctx.kexp[a], self.t.attn_Qe, _exp_lut())
         av = requant(p.astype(np.int64) @ v,  # UINT8×INT8 → INT32，无偏置补偿
                      self.t.layers[a + ".av_requant"].M[ctx.g],
-                     self.t.layers[a + ".av_requant"].N[ctx.g])  # 1/256 已折入
-        o = self._linear_layer(a + ".to_out.0", av, ctx, out_bits=16)
+                     self.t.layers[a + ".av_requant"].N[ctx.g],
+                     bits=16)  # 1/256 已折入；av 细格（§4 v1.1）
+        o = self._linear_layer(a + ".to_out.0", av, ctx, out_bits=16,
+                                   acc_bits=48)
         o_sp = np.ascontiguousarray(o.T).reshape(o.shape[1], h, w)
         res = self._point_codes(x_in, info.block_in, info.block_out, ctx,
                                 wide=True)

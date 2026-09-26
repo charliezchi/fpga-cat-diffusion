@@ -139,23 +139,30 @@ class TestIntLinear:
 
 class TestSiluLut:
     def test_zero_at_center(self):
-        lut = gen_silu_lut(0.03, 0.02)
+        lut = gen_silu_lut(0.03, 0.02 / 256.0)
         assert lut[128] == 0  # silu(0)=0
-        assert lut.dtype == np.int8
+        assert lut.dtype == np.int64
 
     def test_range_and_shape(self):
-        lut = gen_silu_lut(0.05, 0.05)
-        assert lut.shape == (256,)
-        # 输入 -4（a=0.05·…）近似 silu 下界 > -0.28·s_in/s_out
-        assert lut.min() >= -int(0.28 / 0.05 * 1.01) - 1
-        assert lut.max() <= 127
+        lut = gen_silu_lut(0.05, 0.05 / 256.0)
+        assert lut.shape == (257,)
+        # silu 下界 -0.2785 → 细格码 ≈ -0.2785/(0.05/256)
+        assert lut.min() >= -int(0.2785 / (0.05 / 256.0)) - 1
 
-    def test_lookup(self):
-        lut = gen_silu_lut(0.05, 0.05)
-        x = np.array([-128, -1, 0, 1, 127], dtype=np.int32)
+    def test_lookup_interp(self):
+        """细网格查表 + 插值：零点精确、单调、与解析值差 ≤1 细格 LSB。"""
+        s_in, s_fine = 0.05, 0.05 / 256.0
+        lut = gen_silu_lut(s_in, s_fine)
+        x = np.array([-128 * 256, -256, 0, 256, 127 * 256], dtype=np.int64)
         y = silu_lut(lut, x)
         assert y[2] == 0
-        assert y.shape == x.shape
+        # silu 负半轴非单调（极小值 -0.2785 @ x≈-1.28），只验证值域与精度
+        z = np.linspace(-120 * 256, 120 * 256, 997)
+        got = silu_lut(lut, z.astype(np.int64))
+        ref = (z / 256.0 * s_in) / (1 + np.exp(-(z / 256.0 * s_in))) / s_fine
+        # 线性插值误差主导（silu 拐点处曲率最大）：≤3 细格 LSB
+        # = 3/256 ≈ 0.012 INT8 基准 LSB，较 v1.0 直查表仍细 100 倍
+        assert np.abs(got - ref).max() <= 3.0
 
 
 class TestSoftmax:
