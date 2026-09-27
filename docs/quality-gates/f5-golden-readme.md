@@ -10,7 +10,7 @@ golden/
 ├── manifest.json                 # 档位、步选择、量化点清单、格式说明
 ├── checksums.txt                 # 全文件 SHA-256（先校验再使用）
 ├── luts/                         # 由契约公式生成的 LUT（样例档：50 档组 0）
-│   ├── silu_<输入点>__<输出点>__g0.int8.bin   # 256 项 INT8（契约 §5.2）
+│   ├── silu_<输入点>__<输出点>__g0.int32.bin   # 257 项 INT32 基表（契约 §5.2 v1.3+，配线性插值）
 │   ├── exp_4096xu16.bin                       # 4096 项 UINT16，Δ=2^-8，Q1.14（§5.3）
 │   └── rsqrt_even/odd.int32.bin               # 各 2048 项 UINT32（§3）
 ├── e2e/<tier>/                   # tier ∈ {50, 20}

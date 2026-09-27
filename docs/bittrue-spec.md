@@ -58,7 +58,11 @@ acc[i] = Σ_j x_q[j] · w_q[i][j]        # INT8×INT8 / int18×INT8 / INT16×INT
   acc ≤ ~1e8 远离 2^31，此为防御性定义）；**细格 int18 输入的层**（resnet
   conv1/conv2/conv_shortcut、attention to_out、conv_out）用 **INT48**
   （DSP 级联，饱和到 ±(2^47-1)：最坏对齐 3·3·512·130048·127 ≈ 2^46.1 < 2^47），
-  累加中间积用 INT64。
+  累加中间积用 INT64。**例外**：attention to_q/to_k/to_v 输入虽为细格 int18
+  （`<attn>.gn` 点），仍按 **INT32** 累加（与位真模拟器 `acc_bits=32` 一致；
+  最坏 512×131071×128 ≈ 2^33 超 INT32，饱和语义在极端角点承担行为定义，
+  RTL 须在 54 位累加后先做 INT32 饱和再 requant——真实轨迹 acc ≤ ~1e8，
+  饱和永不触发）。
 - FiLM 偏置（仅 ResnetBlock 的 conv1）：`acc[i] += film_q32[i]`（见 §5.1）。
 - 常规卷积偏置（weights.bin 的 fp32 bias）：**融合进 requant M/N 之外的
   b32 项**：`b32[i] = round_half_up(bias[i] / (s_in·s_w[i]))`（acc 域整数，
@@ -370,6 +374,8 @@ artifacts/f5/golden/
   修复后同输入 eps 正交噪声 1.33%→**0.61-0.71%**（E5 容限曲线 0.7%→29.3 dB
   区间内），step0 逐点最差 6.4→1.3 LSB。requant_params 格式不变（版本 3），
   仅导出流程加 margin；RTL 影响：residual 操作数数据通路 19-bit。
+  （v1.4.1 澄清：§2.1 显式列举 attention to_q/k/v 为 INT32 累加例外——
+  与冻结模拟器行为一致，无行为变更，黄金向量不受影响。）
 - **v1.3**（2026-09-27）：内部细网格 256→**1024**（fine_div，INT18 内部数据通路，
   mult18 DSP 原生；GN 输出/SiLU 输出/hidden/av/concat 及 conv_shortcut/to_out/
   conv_out 累加器 INT48；SiLU 插值 sub_bits=10；GN 细格移位参数化）。

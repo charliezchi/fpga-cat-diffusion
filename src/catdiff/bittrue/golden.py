@@ -162,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
     lut_dir.mkdir(parents=True, exist_ok=True)
     tables = load_export(args.export_dir, "50", bt_cfg, unet_cfg)
     for (inp, outp), luts in tables.silu_luts.items():
-        _save_tensor(lut_dir / f"silu_{inp}__{outp}__g0.int8.bin", luts[0])
+        _save_tensor(lut_dir / f"silu_{inp}__{outp}__g0.int32.bin", luts[0])
     _save_tensor(lut_dir / "exp_4096xu16.bin", gen_exp_lut().astype(np.int16))
     lut0, lut1 = gen_rsqrt_lut()
     _save_tensor(lut_dir / "rsqrt_even.int32.bin", lut0.astype(np.int32))
